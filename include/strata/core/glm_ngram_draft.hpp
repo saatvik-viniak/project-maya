@@ -147,6 +147,9 @@ void set_history(const void* model, const std::vector<int32_t>& tokens);
 /// The same with the history in two pieces (a request's prompt, then the tokens it has produced so far): the several-
 /// conversation scheduler registers both before each speculative stint, which may resume an interrupted request.
 void set_history(const void* model, const std::vector<int32_t>& prompt, const std::vector<int32_t>& emitted);
+/// The same whatever STRATA_GLM_NGRAM_DRAFT says (set_history keeps nothing while it is off): pipe2's copy drafts
+/// (STRATA_GLM_PIPE2_COPY) register each conversation's history with it.
+void put_history(const void* model, const std::vector<int32_t>& prompt, const std::vector<int32_t>& emitted);
 /// Takes (and clears) it.
 std::vector<int32_t> take_history(const void* model);
 

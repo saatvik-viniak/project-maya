@@ -55,7 +55,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
+from serve import ds4_vision, energy, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
 from serve import attach, mixed_gpus  # noqa: E402
 from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
 
@@ -6221,6 +6221,10 @@ def make_handler(svc: Service):
                 # the sidebar's Saved: what the model's own API would have charged for the same tokens, per model
                 if self._authorized():
                     self._json(200, svc.savings.report() if svc.savings is not None else {"usd": None, "models": []})
+            elif path == "/api/energy":
+                # Usage and savings > Electricity: this machine's own cost tracker (serve/energy.py), cached
+                if self._authorized():
+                    self._json(200, energy.report())
             elif path == "/api/update":
                 # About > Updates: the latest release (GitHub, cached six hours; ?force=1 asks now) and whether this
                 # folder can update itself

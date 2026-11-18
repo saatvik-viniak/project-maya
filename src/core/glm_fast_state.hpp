@@ -454,6 +454,8 @@ namespace glmtier { struct TierState; }   // glm-dsa B8.2-B8.4: src/core/glm_tie
 struct Glm5Model::FastState {
     bool unified_memory = false;   // set for integrated devices on Linux (HIP APUs, CUDA's GB10 / Grace); Windows keeps the discrete policy
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
+    cudaStream_t fo_s = nullptr;                               // STRATA_GLM_FETCH_OVERLAP: the resident experts' gate/up
+    cudaEvent_t fo_a = nullptr, fo_b = nullptr;
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
     int max_pf = 0;   // MAYA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};
@@ -530,6 +532,7 @@ struct Glm5Model::FastState {
     int* mtp_tok = nullptr;
     int* mtp_tok_h = nullptr;    // pinned
     void* spec_q = nullptr;      // speculative sampling (MAYA_GLM_SPEC_SAMPLE): the draft's kept list, a device SpecList
+    void* spec_qp = nullptr;     // ... decode_spec_pipe's: one SpecList a draft step (kWinMax)
     cudaEvent_t ev_mtp = nullptr;
     // the one-GPU MTP decode (src/core/glm_mtp.cu) - the draft head over the draft vocabulary (Glm5Model::mtp_vocab_scan;
     // mtp_dv == 0: the whole head): the head's first mtp_dv rows in place, then mtp_dx rows gathered from the rest
@@ -541,6 +544,7 @@ struct Glm5Model::FastState {
     // step after the first read there; null: every draft step takes its embedding from the host.  The host's own rows
     // for a draft step go through mtp_emb_h, its copy out ordered by ev_mtp_emb
     void* mtp_emb = nullptr;
+    void* mtp_emb_host = nullptr;   // STRATA_GLM_MTP_CHAIN_HOST: mtp_emb is this mapped pinned copy's device view
     int mtp_emb_type = -1;
     float* mtp_emb_h = nullptr;   // pinned
     cudaEvent_t ev_mtp_emb = nullptr;
@@ -776,9 +780,11 @@ struct Glm5Model::FastState {
     };
     std::vector<BgMove> bg;
     uint64_t bnd_seq = 0;   // boundaries so far (MAYA_GLM_FIXED_MOVES)
+    std::vector<BgMove> apro_pending;   // MAYA_GLM_APROMO: recorded by the service, copied at the next boundary
     bool bg_hold = false;   // lend_tail: no new moves while the pool's tail is lent
     volatile int* route_error_h = nullptr;   // in the mapped ring allocation, visible after compute completion
     uint64_t bg_up = 0, bg_down = 0;
+    std::atomic<uint64_t> apromos{0};   // STRATA_GLM_APROMO: async promotions started (fast_service)
     std::vector<cudaEvent_t> ev_free;
     int* upd_key_h = nullptr;
     unsigned long long* upd_val_h = nullptr;
@@ -871,6 +877,11 @@ struct Glm5Model::FastState {
         int* skip_d = nullptr;
         const volatile int* from = nullptr;
         strata::kernels::SamplerParams pick_sp;
+        // decode_spec_pipe's speculative sampling (the last part): rows t < spec_n verify the draft spec_d[t] drawn
+        // from the kept list spec_q[t] (sample_verify, counter + t); the other rows draw plainly
+        int spec_n = 0;
+        const void* spec_q = nullptr;
+        const int* spec_d = nullptr;
         int32_t pick_tok[32] = {};          // ... the tokens pushed, by slot (a pick's penalty rows count the drafts before it)
         int64_t p0 = 0;
         int T = 0;
@@ -930,6 +941,18 @@ struct Glm5Model::FastState {
             ++ev_n;
         }
     } win;
+    Win win2;                       // STRATA_GLM_PIPE2: the other conversation's window (swapped in by pctx_bind)
+    float* head_x2 = nullptr;       // ... and its NextN input row, drafts and their kept lists
+    int* mtp_tok2 = nullptr;
+    int* mtp_tok_h2 = nullptr;      // (pinned)
+    cudaEvent_t ev_mtp2 = nullptr;
+    void* spec_qp2 = nullptr;
+    Win win3;                       // STRATA_GLM_PIPE_N=3: a third conversation's (pctx_bind's stash slot 2)
+    float* head_x3 = nullptr;
+    int* mtp_tok3 = nullptr;
+    int* mtp_tok_h3 = nullptr;      // (pinned)
+    cudaEvent_t ev_mtp3 = nullptr;
+    void* spec_qp3 = nullptr;
     // ---- the DFlash drafter's target features (src/core/glm_dflash.cu): at each captured layer here, the input's
     //      stream mean of the rows a pass leaves for the drafter, n_embd floats a row (cap_rows rows) - copied out to
     //      the drafter's pinned staging (by position) on this part's stream

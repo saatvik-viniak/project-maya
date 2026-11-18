@@ -3078,6 +3078,11 @@ def quant_of(first: Path) -> str:
 def sha256_ok(path: Path, want) -> bool:
     """`want`: the published sha256, or a list of them - a file published again with only its header changed (v1.0.28:
     the architecture spelled as llama.cpp spells it) keeps the earlier download valid."""
+    # The huihui-ai abliteration rewrites a few tensors in place (and the header), so the files no longer match
+    # unsloth's published sha256 while their sizes are unchanged. MAYA_DS4_TRUST_SIZES=1 trusts that model family.
+    import os as _os
+    if _os.environ.get("MAYA_DS4_TRUST_SIZES") == "1" and "DeepSeek-V4.1-Flash-1017" in str(path):
+        return True
     import hashlib
     h = hashlib.sha256()
     with open(path, "rb") as f:

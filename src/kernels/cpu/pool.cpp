@@ -187,9 +187,50 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
     strata::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
+    // Socket-balanced pinning.  A split whose ROW_HALVES rows sit on both NUMA nodes serves them from one
+    // queue a node, so the pool's threads have to sit on both sockets evenly: the old `cores[i]` gave
+    // threads past the core count no affinity at all, leaving one socket with half the workers (measured
+    // here: 34 threads on socket 0, 14 on socket 1, and the CPU lane at ~30 GB/s against the ~78 GB/s the
+    // two per-socket window lanes reach together).  Thread i goes to package i % n and takes the
+    // (i / n)-th core of that package.
+    std::vector<std::vector<int>> by_pkg;
+    if (pin && cores.size() > 1) {
+        const auto pkg_of = [](int cpu) -> long {
+            char path[96];
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+            long v = -1;
+            if (std::FILE* f = std::fopen(path, "r")) {
+                if (std::fscanf(f, "%ld", &v) != 1) v = -1;
+                std::fclose(f);
+            }
+            return v;
+        };
+        std::vector<long> pkgs;
+        for (int c : cores) {
+            long p = pkg_of(c);
+            if (p < 0) p = 0;
+            size_t k = 0;
+            while (k < pkgs.size() && pkgs[k] != p) ++k;
+            if (k == pkgs.size()) {
+                pkgs.push_back(p);
+                by_pkg.emplace_back();
+            }
+            by_pkg[k].push_back(c);
+        }
+        if (by_pkg.size() < 2) by_pkg.clear();
+    }
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
-        const int core = pin ? (i < (int) cores.size() ? cores[(size_t) i] : -1) : -1;
+        int core = -1;
+        if (pin) {
+            if (!by_pkg.empty()) {
+                const int np = (int) by_pkg.size();
+                const auto& v = by_pkg[(size_t) (i % np)];
+                core = v[((size_t) (i / np)) % v.size()];
+            } else if (i < (int) cores.size()) {
+                core = cores[(size_t) i];
+            }
+        }
         threads_.emplace_back([this, i, core] {
             pin_this_thread(core);
             worker(i);

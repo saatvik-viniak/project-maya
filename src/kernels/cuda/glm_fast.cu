@@ -183,6 +183,32 @@ __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     return x32;
 }
 __device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
+
+#if !defined(STRATA_USE_HIP)
+// Exact, cheaper forms of the two SIMD-in-word ops the i-quant sign decode used (__vcmpne4 / __vsub4 are emulated on
+// sm_70 / sm_86 in several instructions each, and the IQ2/IQ3 expert GEMVs were bound by them):
+//   nz4(v, 0)   = __vcmpne4(v, 0) for words whose bytes are each 0 or at most 0x80 (the sign bits spread one a byte):
+//                 + 0x7f sets a byte's msb exactly when it is nonzero (no carry: 0x80 + 0x7f = 0xff), and prmt's
+//                 sign mode replicates each msb over its byte
+//   neg4(g, m)  = __vsub4(g ^ m, m) for m's bytes 0x00 / 0xff and g's bytes nonzero (every IQ2_XXS / IQ2_XS / IQ2_S /
+//                 IQ3_XXS / IQ3_S grid byte is): the negated byte is (~g) + 1 <= 0xf8, so the word add never carries
+// The same bytes, so the same integer sums: bit for bit the outputs of the emulated forms.
+__device__ __forceinline__ int nz4(uint32_t v, int) {
+    uint32_t d;
+    asm("prmt.b32 %0, %1, 0, 0xBA98;" : "=r"(d) : "r"(v + 0x7f7f7f7fu));
+    return (int) d;
+}
+__device__ __forceinline__ int neg4(uint32_t g, uint32_t m) { return (int) ((g ^ m) + (m & 0x01010101u)); }
+// each byte's msb spread over the byte (0x00 / 0xff)
+__device__ __forceinline__ uint32_t sx4(uint32_t v) {
+    uint32_t d;
+    asm("prmt.b32 %0, %1, 0, 0xBA98;" : "=r"(d) : "r"(v));
+    return d;
+}
+#else
+__device__ __forceinline__ int nz4(uint32_t v, int z) { return __vcmpne4(v, z); }
+__device__ __forceinline__ int neg4(uint32_t g, uint32_t m) { return __vsub4(g ^ m, m); }
+#endif
 __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
@@ -543,12 +569,12 @@ __device__ __forceinline__ float dot_iq2_xxs(const void* vbq, const block_q8_1* 
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*) iq2xxs_grid)[aux8[k0 / 2]];
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int signs0 = nz4(signs & 0x08040201, 0);
+        const int grid0 = neg4(grid_pos.x, signs0);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 0);
         sumi = __dp4a(grid0, u0, sumi);
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int signs1 = nz4(signs & 0x80402010, 0);
+        const int grid1 = neg4(grid_pos.y, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
         sumi = __dp4a(grid1, u1, sumi);
     }
@@ -567,11 +593,11 @@ __device__ __forceinline__ float dot_iq3_xxs(const void* vbq, const block_q8_1* 
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int signs0 = nz4(signs & 0x08040201, 0);
+        const int grid_l = neg4(grid_pos.x, signs0);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int signs1 = nz4(signs & 0x80402010, 0);
+        const int grid_h = neg4(grid_pos.y, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
         sumi = __dp4a(grid_l, u0, sumi);
         sumi = __dp4a(grid_h, u1, sumi);
@@ -718,12 +744,12 @@ __device__ __forceinline__ float dot_iq2_xxs_t(const void* vbq, const block_q8_1
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int signs0 = nz4(signs & 0x08040201, 0);
+        const int grid0 = neg4(grid_pos.x, signs0);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 0);
         sumi = __dp4a(grid0, u0, sumi);
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int signs1 = nz4(signs & 0x80402010, 0);
+        const int grid1 = neg4(grid_pos.y, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
         sumi = __dp4a(grid1, u1, sumi);
     }
@@ -743,11 +769,11 @@ __device__ __forceinline__ float dot_iq3_xxs_t(const void* vbq, const block_q8_1
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int signs0 = nz4(signs & 0x08040201, 0);
+        const int grid_l = neg4(grid_pos.x, signs0);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int signs1 = nz4(signs & 0x80402010, 0);
+        const int grid_h = neg4(grid_pos.y, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
         sumi = __dp4a(grid_l, u0, sumi);
         sumi = __dp4a(grid_h, u1, sumi);
@@ -840,11 +866,15 @@ template<> __device__ __forceinline__ float dw<16>(const uint8_t* row, int kbx, 
         sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[k0 + 0], sumi);
         sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[k0 + 1], sumi);
 #else
-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        sumi = __dp4a((int) __vsub4(grid_pos.x ^ signs0, signs0), x.u[k0 + 0], sumi);
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        sumi = __dp4a((int) __vsub4(grid_pos.y ^ signs1, signs1), x.u[k0 + 1], sumi);
+        // the 7 sign bits + their parity as four + four byte masks: (b * 0x10204080) puts bit i of a nibble at the msb of
+        // byte i (the four copies never overlap), prmt's sign mode spreads each msb over its byte (= unpack_ksigns +
+        // __vcmpne4, the same masks)
+        const uint32_t s7 = (aux32 >> (7 * k0 / 2)) & 127u;
+        const uint32_t bhi = (s7 >> 4) | ((__popc(s7) & 1u) << 3);
+        const uint32_t mlo = sx4((s7 & 15u) * 0x10204080u);
+        const uint32_t mhi = sx4(bhi * 0x10204080u);
+        sumi = __dp4a(neg4(grid_pos.x, mlo), x.u[k0 + 0], sumi);
+        sumi = __dp4a(neg4(grid_pos.y, mhi), x.u[k0 + 1], sumi);
 #endif
     }
     const int ls = aux32 >> 27 | 1;
@@ -866,10 +896,10 @@ template<> __device__ __forceinline__ float dw<18>(const uint8_t* row, int kbx, 
         sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[l0 + 1], sumi);
 #else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        sumi = __dp4a((int) __vsub4(grid_pos.x ^ signs0, signs0), x.u[l0 + 0], sumi);
-        sumi = __dp4a((int) __vsub4(grid_pos.y ^ signs1, signs1), x.u[l0 + 1], sumi);
+        const int signs0 = nz4(signs & 0x08040201, 0);
+        const int signs1 = nz4(signs & 0x80402010, 0);
+        sumi = __dp4a((int) neg4(grid_pos.x, signs0), x.u[l0 + 0], sumi);
+        sumi = __dp4a((int) neg4(grid_pos.y, signs1), x.u[l0 + 1], sumi);
 #endif
     }
     const int ls = aux32 >> 28;
@@ -908,10 +938,10 @@ template<> __device__ __forceinline__ float dw<17>(const uint8_t* row, int kbx, 
         const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
 #else
         const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int signs0 = nz4(signs & 0x08040201, 0);
+        const int signs1 = nz4(signs & 0x80402010, 0);
+        const int grid_l = neg4(grid_pos.x, signs0);
+        const int grid_h = neg4(grid_pos.y, signs1);
 #endif
         if (l0 < 4) {
             sumi0 = __dp4a(grid_l, x.u[l0 + 0], sumi0);
@@ -942,12 +972,10 @@ template<> __device__ __forceinline__ float dw<22>(const uint8_t* row, int kbx, 
         const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
         const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
 #else
-        const int signs0 =
-            __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-        const int signs1 =
-            __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const uint32_t sb = signs_packed_8[l0 / 2];   // (as the byte masks of __vcmpne4 over the spread bits)
+        const uint32_t signs0 = sx4((sb & 15u) * 0x10204080u), signs1 = sx4((sb >> 4) * 0x10204080u);
+        const int grid_l = neg4(grid_pos.x, signs0);
+        const int grid_h = neg4(grid_pos.y, signs1);
 #endif
         if (l0 < 4) {
             sumi0 = __dp4a(grid_l, x.u[l0 + 0], sumi0);
@@ -976,12 +1004,10 @@ template<> __device__ __forceinline__ float dw<21>(const uint8_t* row, int kbx, 
         const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
         const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
 #else
-        const int signs0 =
-            __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
-        const int signs1 =
-            __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const uint32_t sb = signs_packed_8[l0 / 2];   // (as the byte masks of __vcmpne4 over the spread bits)
+        const uint32_t signs0 = sx4((sb & 15u) * 0x10204080u), signs1 = sx4((sb >> 4) * 0x10204080u);
+        const int grid_l = neg4(grid_pos.x, signs0);
+        const int grid_h = neg4(grid_pos.y, signs1);
 #endif
         sumi = __dp4a(grid_l, x.u[l0 + 0], sumi);
         sumi = __dp4a(grid_h, x.u[l0 + 1], sumi);
@@ -3987,6 +4013,10 @@ struct RouteArgs {
                                 // (0: all); the top-1 always runs, the kept weights are renormalised when the model's are
     int norm_mode;              // glm-dsa B5.1: kRouteNormClamp (Maya, llama.cpp) or kRouteNormHf (glm-dsa, + 1e-20)
     unsigned long long rand_seed = 0;   // glm-dsa B15.7: MAYA_GLM_RANDOM_ROUTING's seed (0: the router's own ids)
+    int apro;                   // MAYA_GLM_APROMO: ASYNC PROMOTION - every RAM-tier miss goes to the CPU lane (no
+                                // PCIe fetch on the compute stream); a promotable one also claims a spare, which the
+                                // host fills over the copy stream (promo + cpu bits: fast_service) - live from a later
+                                // boundary.  Same experts, same weights: exact
 };
 
 // kExt: the glm-dsa additions to the route - the HF weight normalisation (norm_mode, B5.1) and the bench mode's random
@@ -4316,6 +4346,21 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                     cpu |= 1u << i;
                     s_cs[i] = src;
                     src = 0ull;
+                } else if (a.apro && src != 0ull) {
+                    // ASYNC PROMOTION: the host computes it now (a null plan entry); a promotable one claims a spare
+                    // whose copy the host runs on the copy stream - the table names the slot only once it landed
+                    cpu |= 1u << i;
+                    s_cs[i] = src;
+                    src = 0ull;
+                    const unsigned int rc = a.fast ? s_rc[i] : a.d.dcnt != nullptr ? a.d.dcnt[key] : 0u;
+                    unsigned long long* const sp = a.fast ? s_sp : spares;
+                    while (next_spare < kSpares && sp[next_spare] == 0ull) ++next_spare;
+                    if (next_spare < kSpares && (a.promote_min <= 1 || rc >= (unsigned int) a.promote_min)) {
+                        s_pp[i] = sp[next_spare];
+                        sp[next_spare] = 0ull;
+                        if (a.fast) spares[next_spare] = 0ull;
+                        promo |= 1u << i;
+                    }
                 } else if (src == 0ull && (i >= a.disk_skip_from || (float) ((double) s_p[s_ids[i]] * inv) < a.disk_skip_w)) {
                     // on disk only and ranked low: left out like a draft's miss (the expert kernels skip a null
                     // plan entry) - this token goes without it instead of waiting on a disk read
@@ -4835,6 +4880,12 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     }
 #endif
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    // STRATA_GLM_FETCH_OVERLAP's two launches: the entries already in VRAM (and the shared expert) beside the PCIe
+    // fetch, the fetched ones after it - each entry's rows are computed exactly as in the one launch
+    if (d.gu_sel != 0) {
+        const bool fetched = ei < 8 && ei != k && d.fetch_src[ei] != 0ull;
+        if ((d.gu_sel == 1) == fetched) return;
+    }
 #if defined(STRATA_USE_HIP)
     if constexpr (!SPLIT)
 #endif
@@ -5344,10 +5395,10 @@ __device__ __forceinline__ void dwm(const uint8_t* row, int kbx, int iqs, const 
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            g[l0] = (int) __vsub4(grid_pos.x ^ signs0, signs0);
-            g[l0 + 1] = (int) __vsub4(grid_pos.y ^ signs1, signs1);
+            const int signs0 = nz4(signs & 0x08040201, 0);
+            const int signs1 = nz4(signs & 0x80402010, 0);
+            g[l0] = (int) neg4(grid_pos.x, signs0);
+            g[l0 + 1] = (int) neg4(grid_pos.y, signs1);
         }
         const int ls = aux32 >> 28;
         const float d = __half2float(bq3->d);
@@ -5369,10 +5420,10 @@ __device__ __forceinline__ void dwm(const uint8_t* row, int kbx, int iqs, const 
         for (int k0 = 0; k0 < 8; k0 += 2) {
             const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            g[k0] = (int) __vsub4(grid_pos.x ^ signs0, signs0);
-            g[k0 + 1] = (int) __vsub4(grid_pos.y ^ signs1, signs1);
+            const int signs0 = nz4(signs & 0x08040201, 0);
+            const int signs1 = nz4(signs & 0x80402010, 0);
+            g[k0] = (int) neg4(grid_pos.x, signs0);
+            g[k0 + 1] = (int) neg4(grid_pos.y, signs1);
         }
         const int ls = aux32 >> 27 | 1;
         const float d = __half2float(bq2->d);
@@ -5418,10 +5469,10 @@ __device__ __forceinline__ void dec_sub(const uint8_t* row, int kbx, int iqs, co
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            o.g[l0] = (int) __vsub4(grid_pos.x ^ signs0, signs0);
-            o.g[l0 + 1] = (int) __vsub4(grid_pos.y ^ signs1, signs1);
+            const int signs0 = nz4(signs & 0x08040201, 0);
+            const int signs1 = nz4(signs & 0x80402010, 0);
+            o.g[l0] = (int) neg4(grid_pos.x, signs0);
+            o.g[l0 + 1] = (int) neg4(grid_pos.y, signs1);
         }
         o.ls = aux32 >> 28;
         o.a = __half2float(bq3->d);
@@ -5434,10 +5485,10 @@ __device__ __forceinline__ void dec_sub(const uint8_t* row, int kbx, int iqs, co
         for (int k0 = 0; k0 < 8; k0 += 2) {
             const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            o.g[k0] = (int) __vsub4(grid_pos.x ^ signs0, signs0);
-            o.g[k0 + 1] = (int) __vsub4(grid_pos.y ^ signs1, signs1);
+            const int signs0 = nz4(signs & 0x08040201, 0);
+            const int signs1 = nz4(signs & 0x80402010, 0);
+            o.g[k0] = (int) neg4(grid_pos.x, signs0);
+            o.g[k0 + 1] = (int) neg4(grid_pos.y, signs1);
         }
         o.ls = aux32 >> 27 | 1;
         o.a = __half2float(bq2->d);
@@ -7024,6 +7075,11 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
         const char* v = getenv("MAYA_GLM_RESIDENT_TOPK");
         return v ? std::max(0, std::atoi(v)) : 0;
     }();
+    static const int apro = [] {
+        const char* v = getenv("MAYA_GLM_APROMO");
+        return v != nullptr && std::atoi(v) != 0 ? 1 : 0;
+    }();
+    a.apro = a.cpu_plan != 0ull ? apro : 0;
     a.res_w = resident_ok ? res_w : 0.0f;
     a.res_k = resident_ok ? res_k : 0;
     // MAYA_GLM_ROUTE_RANK=0: the selections by topk_warp's serial rounds again (A/B); topk_rank needs whole warps of

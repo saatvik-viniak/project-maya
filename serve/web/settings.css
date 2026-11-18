@@ -165,3 +165,16 @@
 .price__in .input--num { width: 100%; min-width: 0; }
 .price__foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
 .price__foot > span { flex: 1 1 200px; line-height: 1.4; }
+
+/* Savings: Electricity (serve/energy.py) */
+.energy { margin-bottom: 12px; }
+.energy__icon { width: 32px; height: 32px; flex: none; display: grid; place-items: center; border-radius: var(--st-r-sm); background: var(--st-fill); font-size: 18px; }
+.energy__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.energy__stat { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.energy__label { font-size: var(--st-fs-xs); color: var(--st-ink-muted); text-transform: uppercase; letter-spacing: .04em; }
+.energy__value { font-size: 1.25rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.energy__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); line-height: 1.35; overflow-wrap: anywhere; }
+.energy__days { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px; }
+.energy__days > span { flex: none; display: flex; flex-direction: column; align-items: center; gap: 1px; padding: 6px 8px; border-radius: var(--st-r-sm); background: var(--st-fill); font-variant-numeric: tabular-nums; }
+.energy__days b { font-size: var(--st-fs-sm); font-weight: 600; }
+.energy__day { font-size: var(--st-fs-xs); color: var(--st-ink-muted); }

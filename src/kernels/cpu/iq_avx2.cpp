@@ -721,6 +721,127 @@ inline float dot1_iq2_xxs(const uint8_t* row, int nb, const block_q8_K* y, const
     return 0.125f * hsum_ggml(accumf);
 }
 
+// IQ2_XXS one token, variant 3 (the default, STRATA_IQ2_VAR=3): variant 1's grid and sign lookups with (a) the block's
+// eight half scales built once - the odd dwords of qs >> 28 as 2s + 1, packed to bytes, one pshufb a half where variant
+// 1 did a shift, an lea, a movd and a broadcast - and (b) the grid indices read as bytes straight into the loads'
+// addresses.  E5-2690 v4, one thread, hot rows: 3.92 values a cycle against variant 1's 3.43 (ggml's dot 3.48); the
+// integer lanes and float steps are ggml's (pick_rows1 checks it).
+inline float dot1_iq2_xxs_v3(const uint8_t* row, int nb, const block_q8_K* y, const uint8_t* pf) {
+    static const auto signs_tab = [] {   // ggml's keven_signs_q2xs: per 7-bit index, 8 bytes of +1 / -1
+        std::array<uint64_t, 128> t{};
+        for (int k = 0; k < 128; ++k) {
+            uint64_t v = 0;
+            for (int j = 0; j < 8; ++j) v |= (uint64_t) ((ksigns_iq2xs[k] >> j) & 1 ? 0xFF : 0x01) << (8 * j);
+            t[(size_t) k] = v;
+        }
+        return t;
+    }();
+    const uint64_t* signs64 = signs_tab.data();
+    const block_iq2_xxs* x = (const block_iq2_xxs*) row;
+    const __m256i one = _mm256_set1_epi32(1);
+    const __m256i pat1 = _mm256_set1_epi16((short) 0x8001), pat3 = _mm256_set1_epi16((short) 0x8003);
+    const __m256i pat5 = _mm256_set1_epi16((short) 0x8005), pat7 = _mm256_set1_epi16((short) 0x8007);
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        if (pf != nullptr) _mm_prefetch((const char*) (pf + (size_t) i * sizeof(block_iq2_xxs)), _MM_HINT_T0);
+        const float d = h2f(x[i].d) * y[i].d;
+        const uint8_t* q2 = (const uint8_t*) x[i].qs;
+        const int8_t* q8 = y[i].qs;
+        // dword 2k + 1 of qs holds half k's scale in its top nibble: lane 0 of the byte pack ends up with halves
+        // (0, 1, 4, 5) at bytes 1, 3, 5, 7 and lane 1 with (2, 3, 6, 7)
+        const __m256i w0 = _mm256_loadu_si256((const __m256i*) q2), w1 = _mm256_loadu_si256((const __m256i*) (q2 + 32));
+        const __m256i s0 = _mm256_or_si256(_mm256_slli_epi32(_mm256_srli_epi32(w0, 28), 1), one);
+        const __m256i s1 = _mm256_or_si256(_mm256_slli_epi32(_mm256_srli_epi32(w1, 28), 1), one);
+        const __m256i p16 = _mm256_packus_epi32(s0, s1);
+        const __m256i pb = _mm256_packus_epi16(p16, p16);
+        const __m256i b0 = _mm256_permute4x64_epi64(pb, 0x00), b1 = _mm256_permute4x64_epi64(pb, 0xAA);
+        const __m256i sc[8] = {_mm256_shuffle_epi8(b0, pat1), _mm256_shuffle_epi8(b0, pat3),
+                               _mm256_shuffle_epi8(b1, pat1), _mm256_shuffle_epi8(b1, pat3),
+                               _mm256_shuffle_epi8(b0, pat5), _mm256_shuffle_epi8(b0, pat7),
+                               _mm256_shuffle_epi8(b1, pat5), _mm256_shuffle_epi8(b1, pat7)};
+        __m256i sumi1 = _mm256_setzero_si256(), sumi2 = _mm256_setzero_si256();
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
+            const uint32_t a1 = u32(q2 + 4), a3 = u32(q2 + 12);
+            const __m256i q2_1 = tab4(iq2xxs_grid, q2[0], q2[1], q2[2], q2[3]);
+            const __m256i q2_2 = tab4(iq2xxs_grid, q2[8], q2[9], q2[10], q2[11]);
+            q2 += 16;
+            const __m256i q8s_1 = _mm256_sign_epi8(q8_1, tab4(signs64, a1 & 127, (a1 >> 7) & 127, (a1 >> 14) & 127, (a1 >> 21) & 127));
+            const __m256i q8s_2 = _mm256_sign_epi8(q8_2, tab4(signs64, a3 & 127, (a3 >> 7) & 127, (a3 >> 14) & 127, (a3 >> 21) & 127));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, q8s_1), sc[ib32]));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, q8s_2), sc[ib32 + 1]));
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    if (pf != nullptr) _mm_prefetch((const char*) (pf + (size_t) nb * sizeof(block_iq2_xxs) - 1), _MM_HINT_T0);
+    return 0.125f * hsum_ggml(accumf);
+}
+
+// IQ2_S (Maya-S's down rows on most layers) on AVX2, one token: ggml's dot with the grid rows by broadcast loads +
+// blends (tab4) instead of set_epi64x's inserts (Broadwell's one shuffle port).  The signs, scales, integer lanes and
+// float steps are ggml's (pick_rows1 checks it).  E5-2690 v4, one thread, hot 2048-wide rows: 3.65 values a cycle
+// against ggml's 3.39.
+inline float dot1_iq2_s(const uint8_t* row, int nb, const block_q8_K* y) {
+    alignas(32) static const uint8_t k_mask1[32] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+                                                    2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3};
+    alignas(32) static const uint8_t k_mask2[32] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128,
+                                                    1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    alignas(32) static const uint8_t k_shuffle[8][32] = {   // ggml's get_scale_shuffle_k4
+        {0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1},
+        {2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3},
+        {4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5},
+        {6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7},
+        {8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9},
+        {10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11},
+        {12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13},
+        {14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15}};
+    const __m128i m4 = _mm_set1_epi8(0xf), m1 = _mm_set1_epi8(1);
+    const __m256i mask1 = _mm256_load_si256((const __m256i*) k_mask1), mask2 = _mm256_load_si256((const __m256i*) k_mask2);
+    const block_iq2_s* x = (const block_iq2_s*) row;
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d = h2f(x[i].d) * y[i].d;
+        const uint8_t* qs = x[i].qs;
+        const uint8_t* qh = x[i].qh;
+        const uint8_t* signs = x[i].qs + QK_K / 8;
+        const int8_t* q8 = y[i].qs;
+        const uint64_t aux64 = u64(x[i].scales);
+        const __m128i scales8 = _mm_add_epi8(_mm_slli_epi16(_mm_and_si128(_mm_set_epi64x((long long) (aux64 >> 4), (long long) aux64), m4), 1), m1);
+        const __m256i scales16 = _mm256_cvtepi8_epi16(scales8);
+        __m256i sumi1 = _mm256_setzero_si256(), sumi2 = _mm256_setzero_si256();
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
+            const unsigned h0 = qh[ib32], h1 = qh[ib32 + 1];
+            const __m256i q2_1 = tab4(iq2s_grid, qs[0] | ((h0 << 8) & 0x300), qs[1] | ((h0 << 6) & 0x300),
+                                      qs[2] | ((h0 << 4) & 0x300), qs[3] | ((h0 << 2) & 0x300));
+            const __m256i q2_2 = tab4(iq2s_grid, qs[4] | ((h1 << 8) & 0x300), qs[5] | ((h1 << 6) & 0x300),
+                                      qs[6] | ((h1 << 4) & 0x300), qs[7] | ((h1 << 2) & 0x300));
+            qs += 8;
+            __m256i aux = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(signs)), mask1), mask2);
+            const __m256i s1 = _mm256_cmpeq_epi8(aux, mask2);
+            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s1, q8_1), s1);
+            aux = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(signs + 4)), mask1), mask2);
+            const __m256i s2 = _mm256_cmpeq_epi8(aux, mask2);
+            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2, q8_2), s2);
+            signs += 8;
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot1, _mm256_shuffle_epi8(scales16, _mm256_load_si256((const __m256i*) k_shuffle[ib32]))));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot2, _mm256_shuffle_epi8(scales16, _mm256_load_si256((const __m256i*) k_shuffle[ib32 + 1]))));
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    return 0.125f * hsum_ggml(accumf);
+}
+
 inline float dot1_iq3_s(const uint8_t* row, int nb, const block_q8_K* y) {
     const __m256i mask1 = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
                                            2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
@@ -776,15 +897,16 @@ void rows1(const uint8_t* w, size_t row_bytes, int n, const void* const* act, in
             const char* v = std::getenv("MAYA_IQ_PF_ROWS");
             return v != nullptr ? std::max(0, std::atoi(v)) : 2;
         }();
-        static const int var = std::getenv("MAYA_IQ2_VAR") ? std::atoi(std::getenv("MAYA_IQ2_VAR")) : 1;
+        static const int var = std::getenv("MAYA_IQ2_VAR") ? std::atoi(std::getenv("MAYA_IQ2_VAR")) : 3;
         for (int r = r0; r < r1; ++r) {
             const uint8_t* row = w + (size_t) r * row_bytes;
             const uint8_t* pf = pf_rows > 0 && r + pf_rows < r1 ? row + (size_t) pf_rows * row_bytes : nullptr;
             for (int t = 0; t < nt; ++t) {
                 const block_q8_K* y = (const block_q8_K*) act[t];
                 const uint8_t* p = t == 0 ? pf : nullptr;
-                out[t][r] = var == 1 ? dot1_iq2_xxs<1>(row, nb, y, p) : var == 2 ? dot1_iq2_xxs<2>(row, nb, y, p)
-                                                                        : dot1_iq2_xxs<0>(row, nb, y, p);
+                out[t][r] = var == 3 ? dot1_iq2_xxs_v3(row, nb, y, p)
+                            : var == 1 ? dot1_iq2_xxs<1>(row, nb, y, p) : var == 2 ? dot1_iq2_xxs<2>(row, nb, y, p)
+                                                                       : dot1_iq2_xxs<0>(row, nb, y, p);
             }
         }
         return;
@@ -793,18 +915,69 @@ void rows1(const uint8_t* w, size_t row_bytes, int n, const void* const* act, in
         const uint8_t* row = w + (size_t) r * row_bytes;
         for (int t = 0; t < nt; ++t) {
             const block_q8_K* y = (const block_q8_K*) act[t];
-            out[t][r] = TY == 18 ? dot1_iq3_xxs(row, nb, y) : dot1_iq3_s(row, nb, y);
+            out[t][r] = TY == 18 ? dot1_iq3_xxs(row, nb, y) : TY == 22 ? dot1_iq2_s(row, nb, y) : dot1_iq3_s(row, nb, y);
         }
     }
 }
 
 }  // namespace
 
+// quantize_row_q8_K on AVX2 (x86 ggml-cpu builds the scalar reference): per 256 values the first x of the largest
+// |x| (the reference's strict >), iscale = -127 / it, q = min(127, rint(iscale x)) (the reference's nearest_int is
+// rint for these magnitudes; the saturating packs give its min), d = 1 / iscale, the bsums of 16.  A zero block: d 0,
+// qs 0, bsums left as they are (the reference's).  Bit for bit the reference (native_expert.cpp checks it once).
+void q8k_quant_avx2(const float* x, void* vy, int64_t k) noexcept {
+    block_q8_K* y = (block_q8_K*) vy;
+    const __m256 signbit = _mm256_set1_ps(-0.0f);
+    const __m256i ones8 = _mm256_set1_epi8(1), ones16 = _mm256_set1_epi16(1);
+    const __m256i order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    for (int64_t i = 0; i < k / QK_K; ++i, x += QK_K) {
+        __m256 m = _mm256_setzero_ps();
+        for (int j = 0; j < QK_K; j += 8) m = _mm256_max_ps(m, _mm256_andnot_ps(signbit, _mm256_loadu_ps(x + j)));
+        __m128 r = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
+        r = _mm_max_ps(r, _mm_movehl_ps(r, r));
+        r = _mm_max_ss(r, _mm_movehdup_ps(r));
+        const float amax = _mm_cvtss_f32(r);
+        if (!(amax > 0.0f)) {
+            y[i].d = 0;
+            std::memset(y[i].qs, 0, QK_K);
+            continue;
+        }
+        const __m256 am = _mm256_set1_ps(amax);
+        float mx = 0.0f;
+        for (int j = 0; j < QK_K; j += 8) {
+            const int msk = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_andnot_ps(signbit, _mm256_loadu_ps(x + j)), am, _CMP_EQ_OQ));
+            if (msk) {
+                mx = x[j + __builtin_ctz((unsigned) msk)];
+                break;
+            }
+        }
+        const float iscale = -127.f / mx;
+        const __m256 is = _mm256_set1_ps(iscale);
+        for (int j = 0; j < QK_K; j += 32) {
+            const __m256i a = _mm256_cvtps_epi32(_mm256_mul_ps(is, _mm256_loadu_ps(x + j)));
+            const __m256i b = _mm256_cvtps_epi32(_mm256_mul_ps(is, _mm256_loadu_ps(x + j + 8)));
+            const __m256i c = _mm256_cvtps_epi32(_mm256_mul_ps(is, _mm256_loadu_ps(x + j + 16)));
+            const __m256i d = _mm256_cvtps_epi32(_mm256_mul_ps(is, _mm256_loadu_ps(x + j + 24)));
+            const __m256i q = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(_mm256_packs_epi32(a, b), _mm256_packs_epi32(c, d)), order);
+            _mm256_storeu_si256((__m256i*) (y[i].qs + j), q);
+            const __m256i s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, q), ones16);
+            const __m128i h2 = _mm_hadd_epi32(_mm256_castsi256_si128(s32), _mm256_extracti128_si256(s32, 1));
+            const __m128i h4 = _mm_hadd_epi32(h2, h2);
+            y[i].bsums[j / 16] = (int16_t) _mm_cvtsi128_si32(h4);
+            y[i].bsums[j / 16 + 1] = (int16_t) _mm_extract_epi32(h4, 1);
+        }
+        y[i].d = 1 / iscale;
+    }
+}
+
 bool iq256_rows1_supported(int type) noexcept {
     // opt-in: on one core 1.05x ggml's dot, but in the 4-GPU decode with every core and SMT sibling busy no faster
     // (4 streams, 10,21,33 split: 19.5-19.8 tok/s a stream with it, 20.2-20.8 with ggml's) - MAYA_IQ2XXS_1T=1 tries it
     static const bool iq2xxs = std::getenv("MAYA_IQ2XXS_1T") != nullptr && std::atoi(std::getenv("MAYA_IQ2XXS_1T")) != 0;
-    return type == 17 || type == 18 || type == 21 || type == 29 || (type == 16 && iq2xxs);
+    // IQ2_S (22): on by default (bit-exact, checked; MAYA_IQ2S_1T=0 keeps ggml's dot)
+    static const bool iq2s = std::getenv("MAYA_IQ2S_1T") == nullptr || std::atoi(std::getenv("MAYA_IQ2S_1T")) != 0;
+    return type == 17 || type == 18 || type == 21 || type == 29 || (type == 16 && iq2xxs) || (type == 22 && iq2s);
 }
 
 void iq256_rows1(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
@@ -812,6 +985,7 @@ void iq256_rows1(int type, const uint8_t* w, size_t row_bytes, int n, const void
     if (type == 16) rows1<16>(w, row_bytes, n, act, nt, out, r0, r1);
     else if (type == 18) rows1<18>(w, row_bytes, n, act, nt, out, r0, r1);
     else if (type == 21) rows1<21>(w, row_bytes, n, act, nt, out, r0, r1);
+    else if (type == 22) rows1<22>(w, row_bytes, n, act, nt, out, r0, r1);
     else if (type == 29) dot_rows_nt<29>(nt, w, row_bytes, n, act, out, r0, r1);
     else if (type == 17) dot_rows_nt<17>(nt, w, row_bytes, n, act, out, r0, r1);
 }

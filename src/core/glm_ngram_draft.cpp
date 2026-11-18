@@ -207,6 +207,15 @@ void set_history(const void* model, const std::vector<int32_t>& prompt, const st
     set_history(model, h);
 }
 
+void put_history(const void* model, const std::vector<int32_t>& prompt, const std::vector<int32_t>& emitted) {
+    std::vector<int32_t> h;
+    h.reserve(prompt.size() + emitted.size());
+    h.insert(h.end(), prompt.begin(), prompt.end());
+    h.insert(h.end(), emitted.begin(), emitted.end());
+    std::lock_guard<std::mutex> lk(g_mu);
+    registry()[model] = std::move(h);
+}
+
 std::vector<int32_t> take_history(const void* model) {
     std::lock_guard<std::mutex> lk(g_mu);
     auto it = registry().find(model);

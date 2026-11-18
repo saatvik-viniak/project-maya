@@ -352,6 +352,75 @@ function PriceCard({p, onSaved}) {
     </div>
   </section>`;
 }
+// Electricity (serve/energy.py, GET /api/energy): this machine's own cost tracker - the live price x its power draw -
+// polled every 10 s while the tab is open, beside what the tokens would have cost on the API (the Saved line)
+const kwh = (v) => (v == null ? "–" : `${v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)} kWh`);
+const usd2 = (v) => (v == null ? "–" : v < 0.01 && v > 0 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`);
+const Stat = ({label, value, sub}) => html`<div class="energy__stat"><span class="energy__label">${label}</span>
+  <b class="energy__value">${value}</b>${sub ? html`<span class="energy__sub">${sub}</span>` : null}</div>`;
+function Energy({saved, savedSince}) {
+  const [e, setE] = useState(null), [err, setErr] = useState("");
+  useEffect(() => {
+    let live = true;
+    const load = () => api("api/energy").then((x) => live && (setE(x), setErr(""))).catch((x) => live && setErr(x.message));
+    load();
+    const t = setInterval(load, 10000);
+    return () => { live = false; clearInterval(t); };
+  }, []);
+  if (err) return html`<p class="set-note">Electricity: ${err}</p>`;
+  if (!e) return html`<p class="set-note">Reading the electricity tracker…</p>`;
+  if (!e.available) return html`<p class="set-note">Electricity: ${e.why}</p>`;
+  const n = e.now || {}, t = e.today || {}, m = e.month || {}, tr = e.tracked || {};
+  const monthName = m.name ? new Date(`${m.name}-01T12:00:00`).toLocaleDateString([], {month: "long"}) : "This month";
+  const trackedSince = tr.since ? new Date(`${tr.since}T12:00:00`).toLocaleDateString([], {month: "short", day: "numeric"}) : "";
+  const net = saved != null && tr.usd != null ? saved - tr.usd : null;
+  return html`<section class="price energy" aria-label="Electricity">
+    <div class="price__head"><span class="energy__icon" aria-hidden="true">⚡</span>
+      <span><b>Electricity</b><span>Live from this machine's cost tracker${n.time ? ` · ${n.time.slice(11, 19)}` : ""}${e.error ? ` · last read failed: ${e.error}` : ""}</span></span>
+      <span class="pill pill--accent">Live</span></div>
+    <div class="energy__grid">
+      <${Stat} label=${`All time${trackedSince ? ` (since ${trackedSince})` : ""}`} value=${usd2(tr.usd)}
+        sub=${`${kwh(tr.kwh)} · the model working ${usd2(tr.active_usd)}, idle ${usd2(tr.idle_usd)}`}/>
+      <${Stat} label="Drawing now" value=${n.ac_w != null ? `${Math.round(n.ac_w)} W` : "–"}
+        sub=${`GPUs ${n.gpu_w != null ? Math.round(n.gpu_w) : "–"} W${(n.gpu_each || []).length ? ` (${n.gpu_each.map((w) => Math.round(w)).join(" / ")})` : ""} · CPU ${n.cpu_w != null ? Math.round(n.cpu_w) : "–"} W`}/>
+      <${Stat} label="Price now" value=${n.price_cents != null ? `${n.price_cents.toFixed(1)}¢/kWh` : "–"}
+        sub=${n.ac_w != null && n.price_cents != null ? `${usd2((n.ac_w / 1000) * (n.price_cents / 100))} an hour at this draw` : ""}/>
+      <${Stat} label="Today" value=${usd2(t.usd)} sub=${`${kwh(t.kwh)} · active ${usd2(t.active_usd)}, idle ${usd2(t.idle_usd)}`}/>
+      <${Stat} label=${monthName} value=${usd2(m.usd)} sub=${`${kwh(m.kwh)} · avg ${m.avg_w != null ? Math.round(m.avg_w) : "–"} W, peak ${m.peak_w != null ? Math.round(m.peak_w) : "–"} W`}/>
+      <${Stat} label="Saved minus electricity" value=${net == null ? "–" : `${net < 0 ? "−" : ""}${usd2(Math.abs(net))}`}
+        sub=${`API value ${usd(saved)}${savedSince ? ` since ${savedSince}` : ""} − electricity ${usd2(tr.usd)}`}/>
+    </div>
+    ${(e.days || []).length ? html`<div class="energy__days" role="list" aria-label="Electricity by day">
+      ${e.days.slice(-14).map((d) => html`<span role="listitem" title=${`${d.day}: ${kwh(d.kwh)}, ${usd2(d.usd)}`}>
+        <span class="energy__day">${d.day ? d.day.slice(5) : ""}</span><b>${usd2(d.usd)}</b><span class="energy__sub">${kwh(d.kwh)}</span></span>`)}
+    </div>` : null}
+    <div class="price__foot"><span>The live ComEd price times the machine's draw (GPUs measured, CPU and board modelled), from ${e.script ? e.script.replace(/^.*\//, "") : "the tracker"}. Electricity counts every hour the machine is on, not only Maya's.</span></div>
+  </section>`;
+}
+// every model's all-time count (all its configs, every start): what its tokens would have cost on its own API
+const mtok = (v) => (v >= 1e6 ? `${(v / 1e6).toFixed(v >= 1e7 ? 0 : 1)}M` : v >= 1e3 ? `${Math.round(v / 1e3)}K` : `${v}`);
+function ModelTotals({r}) {
+  const by = {};
+  for (const m of r.models || []) {
+    const k = m.model || "?", t = m.tokens || {}, b = by[k] || (by[k] = {model: k, usd: 0, priced: false, configs: 0,
+      requests: 0, input: 0, cached: 0, output: 0, since: null, running: false});
+    b.configs += 1; b.requests += t.requests || 0; b.input += t.input || 0; b.cached += t.cached || 0; b.output += t.output || 0;
+    if (m.usd != null) { b.usd += m.usd; b.priced = true; }
+    if (m.since && (!b.since || m.since < b.since)) b.since = m.since;
+    b.running = b.running || m.running;
+  }
+  const list = Object.values(by).sort((a, b) => (b.running - a.running) || (b.usd - a.usd));
+  if (!list.length) return null;
+  const day = (t) => new Date(t * 1000).toLocaleDateString([], {month: "short", day: "numeric"});
+  return html`<section class="price energy" aria-label="All-time usage by model">
+    <div class="price__head"><span class="energy__icon" aria-hidden="true">Σ</span>
+      <span><b>All time, by model</b><span>Every config and every start of each model, added up: what its tokens would have cost on its own API</span></span></div>
+    <div class="energy__grid">${list.map((b) => html`<${Stat} key=${b.model}
+      label=${`${b.model}${b.running ? " (running)" : ""}${b.since ? ` · since ${day(b.since)}` : ""}`}
+      value=${b.priced ? usd(b.usd) : "no API price"}
+      sub=${`${b.requests.toLocaleString()} requests · ${mtok(b.input + b.cached)} tokens read (${mtok(b.cached)} from cache) · ${mtok(b.output)} written · ${b.configs} config${b.configs === 1 ? "" : "s"}`}/>`)}</div>
+  </section>`;
+}
 function Savings() {
   const [r, setR] = useState(null), [err, setErr] = useState("");
   useEffect(() => { api("api/savings").then(setR).catch((e) => setErr(e.message)); }, []);
@@ -364,7 +433,8 @@ function Savings() {
   return html`<${Head} title="Usage and savings" intro="The sidebar's Saved line: what each model's own API would have charged for the same tokens. Change a price when the API's changes, or give one to a model without it. Maya keeps the tokens, so every total is counted again with the new prices."/>
     ${err ? html`<p class="set-note">${err}</p>` : !r ? html`<p class="set-note">Reading the prices…</p>`
       : !(r.price_list || []).length ? html`<p class="set-note">Nothing is counted on this server: it runs without a model config.</p>`
-      : html`<div class="prices">${r.price_list.map((p) => html`<${PriceCard} key=${p.model} p=${p} onSaved=${setR}/>`)}</div>
+      : html`<${ModelTotals} r=${r}/><${Energy} saved=${r.usd} savedSince=${since}/>
+        <div class="prices">${r.price_list.map((p) => html`<${PriceCard} key=${p.model} p=${p} onSaved=${setR}/>`)}</div>
         <${Group}><${Row} label="Start over from $0" sub=${`Every model's count of tokens: ${usd(r.usd)} saved${since ? ` since ${since}` : ""}. The prices stay.`}>
           <button type="button" class="btn btn--danger" onClick=${reset}>Start over</button><//><//>`}`;
 }

@@ -16,7 +16,11 @@
 namespace strata::core::glmpfs {
 
 bool stream_on(bool dsa) {
-    if (!dsa) return false;
+    // GLM-5.3-Flash: off unless MAYA_GLM_FLASH_PREFILL_STREAM=1 - a split whose parts hold only part of their
+    // experts (Maya-S IQ2 over a 3060 + 3x V100: ~56%) streams the rest on each link in turn, so a later part's link
+    // idles while the parts before it compute; with this, its prestage buffer and the early prestage of its first MoE
+    // layer (the same copies, issued earlier) work there too
+    if (!dsa) return strata::glmenv::env_flag("MAYA_GLM_FLASH_PREFILL_STREAM", false);
     return strata::glmenv::env_flag("MAYA_GLM_PREFILL_STREAM", true);
 }
 

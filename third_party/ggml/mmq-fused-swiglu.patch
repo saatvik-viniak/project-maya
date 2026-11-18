@@ -1245,3 +1245,13 @@ index 6923f35..f31b630 100644
          constexpr bool fallback = true;
          mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
      }
+diff --git a/mmq-load-tiles.cuh b/mmq-load-tiles.cuh
+--- a/mmq-load-tiles.cuh
++++ b/mmq-load-tiles.cuh
+@@ -1130,4 +1130,4 @@
+-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq1_m(
+-        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
++template <ggml_type type, int J, bool fallback, bool has_fusion = false> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq1_m(
++        const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+     constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;

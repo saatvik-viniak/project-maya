@@ -2184,11 +2184,20 @@ static int glm_pack_generate(const Options& o) {
                 return 1;
             }
         }
+        // STRATA_GLM_READ_TIMING=1 (diagnostic): the read's time outside the prompt path - the token path's last
+        // tokens and the snapshot - on the "glm vram" line
+        static const bool read_timing = env_num("MAYA_GLM_READ_TIMING", 0) != 0;
+        const auto rt_tp0 = std::chrono::steady_clock::now();
+        double rt_snap_ms = 0.0;
+        size_t rt_tok = 0;
         for (size_t i = i_first; i < prompt.size();) {
             strata::core::progress_at("the prompt: the token path, at token", (int64_t) i);
             strata::core::progress_beat();
             if (model.fast() && !snapped && i == snap_at) {
-                if (model.snapshot_save()) {
+                const auto rt_s0 = std::chrono::steady_clock::now();
+                const bool rt_saved = model.snapshot_save();
+                rt_snap_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rt_s0).count();
+                if (rt_saved) {
                     snap_tokens.assign(prompt.begin(), prompt.begin() + (long) snap_at);
                     snap_img_hash = img_hash(snap_tokens.size());
                     snap_in_slot = false;
@@ -2208,6 +2217,7 @@ static int glm_pack_generate(const Options& o) {
                 return 1;
             }
             i += chunk;
+            rt_tok += chunk;
             if (o.serve) {
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 std::printf("PP %s%zu %zu %.1f %.1f %zu\n", tag.c_str(), i, prompt.size(), ms,
@@ -2221,6 +2231,11 @@ static int glm_pack_generate(const Options& o) {
                 std::fprintf(stderr, "glm vram: prompt %zu tokens read in %.1f s; %s\n",
                              prompt.size() > reuse ? prompt.size() - reuse : (size_t) 0,
                              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), vt.c_str());
+            if (read_timing)
+                std::fprintf(stderr, "glm read timing: token path %zu tokens %.1f ms (snapshot %.1f ms), prompt path "
+                                     "until then %.1f ms\n", rt_tok,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rt_tp0).count(),
+                             rt_snap_ms, std::chrono::duration<double, std::milli>(rt_tp0 - t0).count());
         }
         return 0;
     };
@@ -3438,6 +3453,91 @@ static int glm_pack_generate(const Options& o) {
         if (!resolve_ready()) {
             multi_fail(err);
             return;
+        }
+        // MAYA_GLM_PIPE2: exactly two requests running (MAYA_GLM_PIPE_N=3: two or three), each with a token to feed
+        // and no penalties: all decode speculatively at once (Glm5Model::decode_spec_pipe2) until one ends or input comes
+        if (strata::core::Glm5Model::pipe2_on() && spec_win_env && multi_spec && !step_no_spec && model.spec_ready()) {
+            // MAYA_GLM_PIPE2_PEN (on): requests with penalties too (the loop guard's short repetition penalty) - each
+            // row's pick counts its own history (Glm5Model::pick_tokens); 0: they leave for the token-at-a-time path
+            static const bool pipe2_pen = env_num("MAYA_GLM_PIPE2_PEN", 1) != 0;
+            int n_live = 0, n_pen = 0;
+            for (auto& gp : gens)
+                if (!gp->done) {
+                    ++n_live;
+                    n_pen += gp->sp.penalty_last_n > 0 && !pipe2_pen;
+                }
+            // the token-at-a-time path's tokens in flight come back first (each then has a token to feed)
+            const int pipe_n = strata::core::Glm5Model::pipe_n();
+            if (n_live >= 2 && n_live <= pipe_n && n_pen == 0 && (!flight.empty() || !wflight.empty())) {
+                if (!multi_drain()) {
+                    multi_fail(err);
+                    return;
+                }
+                gen_sweep();
+                return;
+            }
+            std::vector<Gen*> act;
+            for (auto& gp : gens)
+                if (!gp->done && !gp->inflight && gp->pending >= 0 && (pipe2_pen || gp->sp.penalty_last_n <= 0))
+                    act.push_back(gp.get());
+            if (n_live >= 2 && n_live <= pipe_n && (int) act.size() == n_live) {
+                const int nc = n_live;
+                Gen* pg[3] = {act[0], act[1], nc > 2 ? act[2] : nullptr};
+                bind_ctx(pg[0]->ctx);
+                int seqs[3] = {};
+                int32_t pend[3] = {}, fin_force[3] = {};
+                strata::kernels::SamplerParams* sps[3] = {};
+                int64_t mx[3] = {};
+                for (int c = 0; c < nc; ++c) {
+                    seqs[c] = pg[c]->ctx;
+                    pend[c] = pg[c]->pending;
+                    sps[c] = &pg[c]->sp;
+                    mx[c] = pg[c]->max_new - pg[c]->produced;
+                    fin_force[c] = pg[c]->force;
+                }
+                int64_t prod[3] = {0, 0, 0};
+                int32_t last2[3] = {-1, -1, -1}, fout[3] = {-1, -1, -1};
+                bool ended[3] = {false, false, false};
+                // STRATA_GLM_PIPE2_COPY: each conversation's history for its copy drafts (glm_pipe2.cu)
+                static const bool pipe2_copy = env_num("MAYA_GLM_PIPE2_COPY", 0) != 0;
+                if (pipe2_copy)
+                    for (int c = 0; c < nc; ++c)
+                        strata::core::glmng::put_history(strata::core::Glm5Model::pipe2_copy_key(&model, c),
+                                                         pg[c]->prompt, pg[c]->emitted);
+                for (int c = 0; c < nc; ++c) {
+                    Gen* gp = pg[c];
+                    gp->ready = false;
+                    gp->pending = -1;
+                    gp->force = -1;
+                }
+                const bool ok2 = model.decode_spec_pipe2(nc, seqs, pend, sps, mx, fin_force, [&](int c, int tok) {
+                    Gen& g = *pg[c];
+                    if (!gen_token(g, tok)) {
+                        ended[c] = true;
+                        return false;
+                    }
+                    if (g.force >= 0) {
+                        model.force_next(g.force);
+                        g.force = -1;
+                    }
+                    return !input_pending();
+                }, prod, last2, fout, err);
+                if (!ok2) {
+                    multi_fail(err);
+                    return;
+                }
+                for (int c = 0; c < nc; ++c) {
+                    Gen& g = *pg[c];
+                    if (ended[c] || prod[c] >= mx[c]) {
+                        gen_finish(g);
+                    } else {
+                        g.pending = last2[c];
+                        if (fout[c] >= 0) g.force = fout[c];
+                    }
+                }
+                gen_sweep();
+                return;
+            }
         }
         // MAYA_GLM_MULTI_MTP: the ready requests' windows (their last token and the drafts made for the positions
         // after it) in groups as the split's batched rows take them, each group through every part but the last;

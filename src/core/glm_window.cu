@@ -15,10 +15,12 @@
 #include "glm_dsa_fast.hpp"   // glm-dsa L1-4: the mixer's window rows
 #include "glm_fast_state.hpp"
 #include "glm_residual.hpp"   // glm-dsa L1-4: the plain residual's embed / head for a window's rows
+#include "glm_spec_tl.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include "ggml.h"
 
@@ -1486,7 +1488,7 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     const size_t hcE = (size_t) g.hc * E;
     FastState* F = m->fast_;
     auto& W = F->win;
-    const int64_t p = fast_->win.p0 + t;
+    const int64_t p = W.p0 + t;   // (each part's window has the same p0; its own: PIPE2 binds the parts apart)
     const int sl = W.bank * kPipeMax + t;   // this window's slot of token t
     const size_t needed_p2p_bytes = (size_t) kPipeSlots * hcE * sizeof(float);
     auto get_p2p_buf = [&](int src_dev, int dst_dev) -> float* {
@@ -1517,12 +1519,15 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
         return p2p_slot_buf[src_dev];
     };
     cudaSetDevice(m->dev_);
+    spec_tl::host('E', k, (int) p, (int) W.p0);
     if (prev == nullptr) {
+        spec_tl::at_stream(F->cs, 'G', k, (int) p, (int) W.p0);
         cudaMemcpyAsync(W.emb + (size_t) sl * E, W.emb_h + (size_t) sl * E, (size_t) E * sizeof(float),
                         cudaMemcpyHostToDevice, F->cs);
         gf::embed_streams(W.emb + (size_t) sl * E, m->state_, E, F->cs);
     } else {
         cudaStreamWaitEvent(F->cs, prev->fast_->win.ev_tok[sl], 0);
+        spec_tl::at_stream(F->cs, 'G', k, (int) p, (int) W.p0);
         if (float* pbuf = get_p2p_buf(prev->dev_, m->dev_)) {
             cudaMemcpyPeerAsync(m->state_, m->dev_, pbuf + (size_t) sl * hcE, prev->dev_, hcE * sizeof(float), F->cs);
         } else {
@@ -1547,6 +1552,8 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
             cudaMemcpyAsync(W.hop_h + (size_t) sl * hcE, m->state_, hcE * sizeof(float), cudaMemcpyDeviceToHost, F->cs);
         }
         cudaEventRecord(W.ev_tok[sl], F->cs);
+        spec_tl::at_stream(F->cs, 'g', k, (int) p, (int) W.p0);
+        spec_tl::host('e', k, (int) p, (int) W.p0);
         return true;
     }
     // the last part: this token's pick now - its head row, the output GEMV, the argmax (or row t's draw at the
@@ -1569,7 +1576,11 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
             strata::kernels::SamplerParams sp = W.pick_sp;
             sp.counter += (uint64_t) t;
             // (penalties: this window's tokens 1..t before it - pick_tok, written before token t was queued)
-            m->pick_tokens(lg, 1, sp, W.pick_tok + (sl - t), t, W.tok + sl, F->cs);
+            if (t < W.spec_n && W.spec_q != nullptr && W.spec_d != nullptr)   // (penalties: over the row's history)
+                m->pick_tokens(lg, 1, sp, W.pick_tok + (sl - t), t, W.tok + sl, F->cs,
+                               (const strata::kernels::SpecList*) W.spec_q + t, W.spec_d + t);
+            else
+                m->pick_tokens(lg, 1, sp, W.pick_tok + (sl - t), t, W.tok + sl, F->cs);
         } else {
             gf::argmax(lg, g.n_vocab, W.tok + sl, F->cs);
         }
@@ -1577,6 +1588,8 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     gf::set_skip(nullptr);
     cudaMemcpyAsync(W.tok_h + sl, W.tok + sl, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
     cudaEventRecord(W.ev_pick[sl], F->cs);
+    spec_tl::at_stream(F->cs, 'g', k, (int) p, (int) W.p0);
+    spec_tl::host('e', k, (int) p, (int) W.p0);
     return true;
 }
 
@@ -1634,7 +1647,11 @@ bool Glm5Model::win_head_split(int t, int sl, const float* hx, float* lg, std::s
         cudaMemcpyAsync(lg + c0, ht_lg_h_ + (size_t) sl * nc, (size_t) nc * sizeof(float), cudaMemcpyHostToDevice, F->cs);
         strata::kernels::SamplerParams sp = W.pick_sp;
         sp.counter += (uint64_t) t;
-        pick_tokens(lg, 1, sp, W.pick_tok + (sl - t), t, W.tok + sl, F->cs);
+        if (t < W.spec_n && W.spec_q != nullptr && W.spec_d != nullptr)
+            pick_tokens(lg, 1, sp, W.pick_tok + (sl - t), t, W.tok + sl, F->cs,
+                        (const strata::kernels::SpecList*) W.spec_q + t, W.spec_d + t);
+        else
+            pick_tokens(lg, 1, sp, W.pick_tok + (sl - t), t, W.tok + sl, F->cs);
     } else {
         int* own = ht_pair_d_ + (size_t) sl * 4;
         gf::argmax_pair(lg, c0, own, F->cs);
@@ -1744,6 +1761,7 @@ bool Glm5Model::win_pipe_begin(int32_t first, std::string& err, const strata::ke
         W.piped = true;
         W.bank ^= 1;
         W.pick_sampled = sp != nullptr && (!sp->greedy || sp->penalty_last_n > 0);   // (penalties: the sampler's pick)
+        W.spec_n = 0;   // (decode_spec_pipe sets it, with the drafts, before the last part takes the window's rows)
         if (W.pick_sampled) W.pick_sp = *sp;
     }
     // the tokens past a wrong draft skip their heavy kernels (MAYA_GLM_WIN_SKIP=0: they run anyway)
@@ -1967,7 +1985,8 @@ bool Glm5Model::win_pipe_end(int32_t* out, std::string& err) {
         // MAYA_GLM_PROF: the T tokens' phases on each part (its "start" holds the wait for the previous part)
         if (m->fast_->prof_on) {
             m->fast_->collect();
-            if (m->fast_->ptokens > 0) m->fast_->ptokens += (uint64_t) T - 1;
+            // the pipelined window is the whole decode here (the token path never counted): start the count
+            m->fast_->ptokens = m->fast_->ptokens > 0 ? m->fast_->ptokens + (uint64_t) T - 1 : (uint64_t) T;
         }
     }
     last_tok_ = out[T - 1];

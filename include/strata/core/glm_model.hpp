@@ -267,8 +267,10 @@ public:
     /// window's tokens, nullptr for a lone pick; n0: the drafts before row 0, a pipelined window's token).  So a draft
     /// stands only where it is the penalized pick: drafting counts exactly the history plain decode counts.  Without
     /// penalties it is exactly the sample_tokens call the sites made before.
+    /// spec_q / spec_d (speculative sampling's verify, T == 1): row 0 keeps the draft spec_d[0] drawn from the kept
+    /// list spec_q[0] with min(1, p/q), else draws from max(0, p - q) - p with the penalties over the same history
     void pick_tokens(const float* logits, int T, const strata::kernels::SamplerParams& sp, const int32_t* win, int n0,
-                     int* out, cudaStream_t s);
+                     int* out, cudaStream_t s, const void* spec_q = nullptr, const int* spec_d = nullptr);
     /// Zeroes R, every KDA state and every DSA cache: the next `forward` starts a fresh sequence.
     void reset();
 
@@ -580,6 +582,7 @@ public:
     bool host_logits_ = true;
     int last_tok_ = -1;                                    // the greedy argmax of the last fast forward
     const strata::kernels::SamplerParams* mtp_sample_ = nullptr;   // decode_spec, MAYA_GLM_SPEC_SAMPLE: fast_mtp DRAWS
+    void* mtp_pipe_q_ = nullptr;   // decode_spec_pipe's speculative sampling: draft step i draws into SpecList i here
     int32_t force_tok_ = -1;                               // force_next()
     // pick_tokens' penalty rows (this part's, allocated with the first request that has penalties): a ring of
     // kPenRows rows of pen_w_ tokens, pinned + device, each row's event recorded behind the pick that read it (the
@@ -806,6 +809,21 @@ public:
     bool decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                           int64_t& produced, std::string& err);   // the MTP drafts through a pipelined verify window
                                                                    // over a split (MAYA_GLM_SPEC_WIN, glm_mtp.cu)
+    /// MAYA_GLM_PIPE2: TWO conversations' pipelined speculative decodes at once over the split (glm_pipe2.cu) - each
+    /// its own verify windows (a second Win per part, swapped in with its sequence by pctx_bind), their rows taking
+    /// turns on the parts' streams.  seqs: the two sequence indices; pending: each one's written, not fed token (fed
+    /// first); emit(c, tok): conversation c's token out (false: that conversation stops).  last[c]: each one's last
+    /// token written and not fed, for the caller to keep as its pending one.
+    /// n (STRATA_GLM_PIPE_N): 2 or 3 conversations, the arrays n long.
+    bool decode_spec_pipe2(int n, const int seqs[], const int32_t pending[], strata::kernels::SamplerParams* sp[],
+                           const int64_t max_new[], const int32_t force[],
+                           const std::function<bool(int, int)>& emit, int64_t produced[], int32_t last[],
+                           int32_t force_out[], std::string& err);
+    static int pipe_n();   // STRATA_GLM_PIPE_N (2; 3: pipe2 takes three conversations too)
+    static bool pipe2_on();
+    /// STRATA_GLM_PIPE2_COPY: the key conversation c's history is registered under (glmng::set_history) for
+    /// decode_spec_pipe2 on this model (the head part)
+    static const void* pipe2_copy_key(const Glm5Model* m, int c) { return reinterpret_cast<const char*>(m) + 1 + c; }
     uint64_t mtp_rounds_ = 0;                              // verify passes (spec_steps_ / spec_hits_: drafts, accepted)
     uint64_t mtp_round_n_[9] = {};                         // ... by the draft length the round used
     bool mtp_fill_prev(int32_t token, int64_t p, std::string& err);   // the token path: entry p - 1 from head_x and token
@@ -1043,6 +1061,33 @@ public:
     /// token - a token's launches on nine parts took the one host thread ~3-5 ms, longer than any part's GPU time
     struct PipeCrew;
     PipeCrew* crew_ = nullptr;
+    // ---- STRATA_GLM_PIPE2 (glm_pipe2.cu): the conversation each part has bound (0 / 1), its other one's stash, and
+    //      the part's lock (bind + enqueue)
+    struct Crew2;
+    Crew2* crew2_ = nullptr;
+    // STRATA_GLM_PIPE_N=3: up to three conversations - the bound one's buffers are the part's own (win, head_x, ...),
+    // each other one's sit in a stash slot (1: win2 ..., 2: win3 ...); pslot_[c] is conversation c's slot (0: bound).
+    // A conversation's buffers move with it, so it always gets back the same ones (the KDA graphs are keyed by pctx_)
+    static constexpr int kPipeN = 3;
+    int pctx_ = 0;
+    int pseq_[kPipeN] = {0, 0, 0};
+    int pslot_[kPipeN] = {0, 1, 2};
+    bool px_kda_bak_cur_[kPipeN] = {false, false, false};
+    int64_t px_mtp_hx_pos_[kPipeN] = {-1, -1, -1};
+    const strata::kernels::SamplerParams* px_mtp_sample_[kPipeN] = {nullptr, nullptr, nullptr};
+    void* px_mtp_pipe_q_[kPipeN] = {nullptr, nullptr, nullptr};
+    void pctx_swap(int s);   // the bound buffers <-> stash slot s
+    std::unique_ptr<std::mutex> pmu_{new std::mutex};
+    void pctx_bind(int c);
+    bool pctx_alloc(int n, std::string& err);
+    bool win2_begin(int c, int32_t first, const strata::kernels::SamplerParams* sp, bool fresh, std::string& err);
+    bool win2_push(int c, int32_t token, std::string& err);
+    int win2_pick(int c, int t, int32_t& pick, std::string& err);   // 1 ready, 0 not yet, -1 failed
+    bool win2_settle(int c, int T, std::string& err);
+    void win2_cancel_from(int c, int t);
+    bool win2_commit(int c, int n_keep, int T, int64_t p0, std::string& err);
+    void win2_commit_wait(int c);
+    void crew2_stop();
     bool win_pipe_part(int k, int t, std::string& err);   // part k's share of window token t (a crew thread's job)
     void win_crew_stop();
     /// window_pipe's token t: KDA layer il's projections go to its window input rows (window_commit replays from them)

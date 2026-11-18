@@ -316,6 +316,8 @@ struct MoeDev {
     int* route_err_d = nullptr;                // ... and its device copy, which the route kernel reads (a read of the
                                                //     host-mapped one crossed PCIe at every route's start); null: none
     const int* skip = nullptr;                 // set_skip's flag: non-zero = the experts' kernels do nothing
+    int gu_sel = 0;                            // moe_gate_up: 0 every entry; 1 the entries with nothing to fetch (and
+                                               // the shared expert); 2 only the entries with a fetch (STRATA_GLM_FETCH_OVERLAP)
     // moe_experts_multi: mt_T tokens in one launch, token t's plan at plan_ptr / plan_w + 8 t and its rows at these
     // strides (q8_1 blocks: its FFN input, its h, its shared expert's h; floats: its output, its CPU part)
     int mt_T = 1;

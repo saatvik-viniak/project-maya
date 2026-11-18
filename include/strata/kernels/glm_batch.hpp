@@ -113,6 +113,9 @@ bool mla_wmma2_default();
 /// n_head x (kv_lora + 2) floats.  False (nothing launched) off Volta, for other shapes, or with MAYA_GLM_MLA_V70=0.
 bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
                     float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8 = false);
+/// The v70 kernel's one-time cudaFuncSetAttribute - call once per part at setup, before any CUDA stream capture:
+/// inside a capture that host call is rejected and the capture fails.
+void mla_v70_warm();
 /// Absorbed MLA attention per token and head over the token's cells: ctx[t][h] = softmax(q_abs[t][h] . lat_c *
 /// scale) . lat_c.  kv_lora 512, n_head % 16 == 0.
 void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max, int n_head,

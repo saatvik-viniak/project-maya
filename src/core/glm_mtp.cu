@@ -29,6 +29,7 @@
 //
 // The NextN cache's entry p pairs h_p with the token at p + 1 (the prompt path writes them so).
 #include "glm_dsa_fast.hpp"   // glm-dsa L1-4: the block's cache rows through its mixer
+#include "glm_spec_tl.hpp"
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -268,11 +269,35 @@ void Glm5Model::mtp_draft_setup(bool chain) {
     if (F->ev_mtp_emb == nullptr)
         if (cudaEventCreateWithFlags(&F->ev_mtp_emb, cudaEventDisableTiming) != cudaSuccess)
             cudaGetLastError();
-    if (want && room && pack_emb_src_ != nullptr &&
+    // STRATA_GLM_MTP_CHAIN_HOST=1: without the room, the chain reads token_embd from a mapped pinned copy in host RAM
+    // (a draft step's one row over PCIe, a few microseconds) - the drafts chain on the device all the same
+    static const bool chain_host = [] {
+        const char* v = getenv("MAYA_GLM_MTP_CHAIN_HOST");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    const bool host_copy = !room && chain_host;
+    if (want && (room || host_copy) && pack_emb_src_ != nullptr &&
         (pack_emb_type_ == GGML_TYPE_Q6_K || pack_emb_type_ == GGML_TYPE_Q8_0) && g.n_embd % 256 == 0) {
-        bool ok = cudaMalloc(&F->mtp_emb, tb) == cudaSuccess &&
-                  cudaMemcpy(F->mtp_emb, pack_emb_src_, tb, cudaMemcpyHostToDevice) == cudaSuccess &&
-                  F->mtp_emb_h != nullptr && F->ev_mtp_emb != nullptr;
+        bool ok = false;
+        if (host_copy) {
+            void* hp = nullptr;
+            void* dp = nullptr;
+            ok = cudaHostAlloc(&hp, tb, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess;
+            if (ok) {
+                std::memcpy(hp, pack_emb_src_, tb);
+                ok = cudaHostGetDevicePointer(&dp, hp, 0) == cudaSuccess;
+            }
+            if (ok) {
+                F->mtp_emb = dp;
+                F->mtp_emb_host = hp;
+            } else if (hp != nullptr) {
+                cudaFreeHost(hp);
+            }
+        } else {
+            ok = cudaMalloc(&F->mtp_emb, tb) == cudaSuccess &&
+                 cudaMemcpy(F->mtp_emb, pack_emb_src_, tb, cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+        ok = ok && F->mtp_emb_h != nullptr && F->ev_mtp_emb != nullptr;
         F->mtp_emb_type = (int) pack_emb_type_;
         // the device's rows against the host's dequantization (the token path's): the same floats, or no chain
         const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
@@ -293,8 +318,10 @@ void Glm5Model::mtp_draft_setup(bool chain) {
         if (d_row) cudaFree(d_row);
         if (!ok) {
             cudaGetLastError();
-            if (F->mtp_emb) cudaFree(F->mtp_emb);
+            if (F->mtp_emb_host) cudaFreeHost(F->mtp_emb_host);
+            else if (F->mtp_emb) cudaFree(F->mtp_emb);
             F->mtp_emb = nullptr;
+            F->mtp_emb_host = nullptr;
             std::fprintf(stderr, "glm mtp: CUDA%d token_embd did not set up on the device - the drafts go step by step\n",
                          dev_);
         }
@@ -307,7 +334,8 @@ void Glm5Model::mtp_draft_setup(bool chain) {
     else
         std::fprintf(stderr, "glm mtp: CUDA%d the MTP decode drafts over the whole vocabulary", dev_);
     if (F->mtp_emb)
-        std::fprintf(stderr, ", chained on the device (token_embd there, %.0f MB)\n", (double) tb / 1048576.0);
+        std::fprintf(stderr, ", chained on the device (token_embd %s, %.0f MB)\n",
+                     F->mtp_emb_host != nullptr ? "in mapped host RAM" : "there", (double) tb / 1048576.0);
     else
         std::fprintf(stderr, "\n");
 }
@@ -855,6 +883,41 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
     const Glm5Geometry& g = g_;
     (void) g;
     const int n_cap = std::min(mtp_draft_cap(), std::min(kPipeMax - 1, 8));
+    // MAYA_GLM_SPEC_SAMPLE=1: SPECULATIVE SAMPLING for sampled requests (no penalties) - each draft step DRAWS its
+    // draft from the NextN block's distribution q (the request's sampler chain on the whole head, a Philox stream of its
+    // own, the counter of the row that checks it) and row t keeps draft t + 1 with probability min(1, p/q), else draws
+    // from max(0, p - q) (sample_verify): every token keeps the plain draw's distribution exactly, and a draft stands
+    // sum(min(p, q)) of the time instead of p(the draft).  A fixed seed repeats its answer, not the plain draw's one.
+    static const bool pipe_sample_env = [] {
+        const char* v = getenv("MAYA_GLM_SPEC_SAMPLE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    bool pipe_sample = pipe_sample_env && !sp.greedy && sp.temperature > 0.0f && sp.penalty_last_n <= 0;
+    if (pipe_sample && FT->spec_qp == nullptr) {
+        cudaSetDevice(TL->dev_);
+        if (cudaMalloc(&FT->spec_qp, (size_t) kWinMax * sizeof(strata::kernels::SpecList)) != cudaSuccess) {
+            cudaGetLastError();
+            FT->spec_qp = nullptr;
+            pipe_sample = false;
+        }
+        cudaSetDevice(dev_);
+        std::fprintf(stderr, "glm spec pipe: speculative sampling %s (MAYA_GLM_SPEC_SAMPLE)\n",
+                     pipe_sample ? "ON - the drafts are drawn from the draft block, each kept with min(1, p/q)"
+                                 : "requested, but its lists did not allocate - off");
+    }
+    struct PipeSampleOff {   // fast_mtp draws only inside this request's decode
+        Glm5Model* m;
+        ~PipeSampleOff() {
+            if (m != nullptr) {
+                m->mtp_sample_ = nullptr;
+                m->mtp_pipe_q_ = nullptr;
+            }
+        }
+    } pipe_sample_off{pipe_sample ? TL : nullptr};
+    if (pipe_sample) {
+        TL->mtp_sample_ = &sp;
+        TL->mtp_pipe_q_ = FT->spec_qp;
+    }
     static const bool trace = getenv("MAYA_GLM_MTP_TRACE") != nullptr;
     const auto ms_since = [](std::chrono::steady_clock::time_point a) {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
@@ -885,6 +948,8 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
     bool begun = false;
     bool ok = true;
     int64_t rounds = 0, drafted = 0, accepted = 0;
+    double ph[3] = {0.0, 0.0, 0.0};   // MAYA_GLM_MTP_TRACE: a round's host phases - drafts, verify, commit + cache
+    int64_t n_ph = 0;
     // MAYA_GLM_WIN_COMMIT_WAIT=1: the parts' commits waited for (A/B; off: the next window queues behind them)
     static const bool commit_wait = [] {
         const char* v = getenv("MAYA_GLM_WIN_COMMIT_WAIT");
@@ -895,6 +960,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
     for (;;) {
         const auto t_round = std::chrono::steady_clock::now();
         const int64_t N = pos_;                 // where y (the last confirmed token) goes
+        spec_tl::host('R', (int) rounds, (int) N, 0);
         // MAYA_GLM_SPEC_WIN=2: the batched verify window (window(): the whole window through the parts, like the
         // one-GPU MTP decode's) instead of the pipelined per-token one
         static const bool batched_win = [] {
@@ -921,7 +987,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                     for (int i = 0; i < n && ok; ++i) {
                         // glm-dsa L1-4: a later step's carrier is the step before's output (decode_mtp's rule)
                         if (i > 0 && g.arch == GlmArch::GlmDsa) TL->mtp_carry_note(N - 1 + i, FT->head_x, FT->cs);
-                        ok = TL->fast_mtp(N - 1 + i, i == 0 ? y : -1, err, i, true, false);
+                        ok = TL->fast_mtp(N - 1 + i, i == 0 ? y : -1, err, i, !pipe_sample, false);
                     }
                     if (ok) {
                         cudaMemcpyAsync(FT->mtp_tok_h, FT->mtp_tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost,
@@ -939,7 +1005,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                     int32_t tok = y;
                     for (int i = 0; i < n && ok; ++i) {
                         if (i > 0 && g.arch == GlmArch::GlmDsa) TL->mtp_carry_note(N - 1 + i, FT->head_x, FT->cs);
-                        if (!TL->fast_mtp(N - 1 + i, tok, err, i, true) ||
+                        if (!TL->fast_mtp(N - 1 + i, tok, err, i, !pipe_sample) ||
                             !glmfast::wait_event(FT->ev_mtp, "glm spec pipe draft", err) ||
                             !TL->fast_->route_ok(err)) {
                             ok = false;
@@ -947,6 +1013,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                         }
                         tok = glmfast::draft_id(FT->mtp_tok_h[i], tok, g.n_vocab, "glm spec pipe");
                         winv[(size_t) i + 1] = tok;
+                        spec_tl::host('D', i + 1, 0, 0);
                         if (!batched_win && !win_pipe_push(tok, err)) {
                             ok = false;
                             break;
@@ -961,8 +1028,13 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                 TL->mtp_hx_pos_ = -1;   // (head_x holds the block's own hidden state once the steps ran)
             }
         }
+        // the last part's rows verify the drafts drawn above (its crew thread takes them only after the push below)
+        FT->win.spec_n = pipe_sample && !batched_win ? nd : 0;
+        FT->win.spec_q = FT->spec_qp;
+        FT->win.spec_d = FT->mtp_tok;
         if (!batched_win && !win_pipe_push(-1, err)) { ok = false; break; }
         if (trace) std::fprintf(stderr, "glm spec pipe: p0 %lld drafts %d\n", (long long) N, nd);
+        const auto t_draft = std::chrono::steady_clock::now();
         // ---- the window's tokens: the anchor y (t = 0, already begun) and the drafts
         const int T = 1 + nd;
         int acc = 0;
@@ -986,6 +1058,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
             for (int t = 0; t < T; ++t) {
                 int32_t pick = -1;
                 if (!win_pipe_pick(t, pick, err)) { ok = false; break; }
+                spec_tl::host('P', t, pick, 0);
                 out[(size_t) t] = pick;
                 if (t + 1 >= T) break;
                 const int32_t want = (t == 0 && force_tok_ >= 0) ? force_tok_ : winv[(size_t) t + 1];
@@ -1000,6 +1073,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
             }
             if (!ok) break;
             if (!win_pipe_settle(err)) { ok = false; break; }
+            spec_tl::host('S', acc, T, 0);
         }
         drafted += nd;
         accepted += acc;
@@ -1012,6 +1086,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
             const size_t sl0 = (size_t) (batched_win ? 0 : TL->fast_->win.bank * kPipeMax);
             rows_hx = TL->fast_->win.head_x + sl0 * (size_t) g.n_embd;
         }
+        const auto t_verify = std::chrono::steady_clock::now();
         // ---- the kept tokens go out in order
         bool more = true;
         int kept = 0;
@@ -1030,6 +1105,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
         // finish enqueueing their commit work before touching the block part's stream below
         if (!window_commit(keep, err, commit_wait || !more)) { ok = false; break; }
         win_commit_wait();
+        spec_tl::host('C', keep, 0, 0);
         // ---- the NextN cache: entries p0..p0 + keep - 2 from the kept rows' trunk states and the accepted drafts
         // (a kept row's cache entries replace what the wrong drafts wrote at the same positions), and head_x again
         // holds the FIRST DRAFT STEP's trunk hidden state for the next round's drafts.  MAYA_GLM_SPEC_PIPE_DRAIN=1
@@ -1051,7 +1127,14 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                         cudaMemcpyDeviceToDevice, FT->cs);
         TL->mtp_hx_pos_ = N + keep - 1;
         if (g.arch == GlmArch::GlmDsa) TL->mtp_carry_note(TL->mtp_hx_pos_, FT->head_x, FT->cs);   // (glm-dsa L1-4)
-        if (trace) std::fprintf(stderr, "glm spec pipe2: p0 %lld keep %d acc %d (%d rows)\n", (long long) N, keep, acc, T);
+        if (trace) {
+            const auto t_commit = std::chrono::steady_clock::now();
+            ph[0] += std::chrono::duration<double, std::milli>(t_draft - t_round).count();
+            ph[1] += std::chrono::duration<double, std::milli>(t_verify - t_draft).count();
+            ph[2] += std::chrono::duration<double, std::milli>(t_commit - t_verify).count();
+            ++n_ph;
+            std::fprintf(stderr, "glm spec pipe2: p0 %lld keep %d acc %d (%d rows)\n", (long long) N, keep, acc, T);
+        }
         // the adaptive length's bookkeeping (decode_mtp's; the round's wall time is the length's next measurement)
         {
             const double ms = ms_since(t_round);
@@ -1076,6 +1159,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
         if (!batched_win) {
             if (!win_pipe_begin(-1 - y, err, &sp, (rounds % 8) == 0)) { ok = false; break; }
             begun = true;
+            spec_tl::host('B', 0, 0, 0);
         }
     }
     // the drain: the parts' streams idle and the routes checked
@@ -1101,7 +1185,12 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
     if (rounds > 0 && trace)
         std::fprintf(stderr, "glm spec pipe: %lld rounds, %.2f drafts, %.2f accepted a round\n",
                      (long long) rounds, (double) drafted / (double) rounds, (double) accepted / (double) rounds);
+    if (n_ph > 0)
+        std::fprintf(stderr, "glm spec pipe: a round's host time - drafts %.2f ms, verify %.2f ms, commit + cache "
+                             "%.2f ms (%lld rounds)\n", ph[0] / (double) n_ph, ph[1] / (double) n_ph,
+                     ph[2] / (double) n_ph, (long long) n_ph);
     win_prof_report();
+    spec_tl::flush();
     if (ok && gf::launch_errors() > 0) {
         err = "glm spec pipe: a kernel launch failed (see stderr)";
         ok = false;

@@ -2450,6 +2450,32 @@ void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_poo
     check("dsa_select");
 }
 
+namespace {
+int g_v70_ok[16] = {}, g_v70_sms[16] = {};
+int mla_v70_ok(int dev) {
+    if (g_v70_ok[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        cudaDeviceGetAttribute(&g_v70_sms[dev], cudaDevAttrMultiProcessorCount, dev);
+        g_v70_ok[dev] = major == 7 && minor < 5 &&
+                                cudaFuncSetAttribute(mla_attn_v70_kernel<true>,
+                                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kV7Smem) ==
+                            cudaSuccess
+                        ? 1
+                        : -1;
+        cudaGetLastError();
+        if (g_v70_ok[dev] == 1)
+            std::fprintf(stderr, "glm_batch: CUDA%d decode attention: the split one-pass kernel (mma.m8n8k4)\n", dev);
+    }
+    return g_v70_ok[dev];
+}
+}  // namespace
+void mla_v70_warm() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 0 && dev < 16) (void) mla_v70_ok(dev);
+}
 bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
                     float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8) {
 #if defined(STRATA_USE_HIP)
@@ -2466,22 +2492,7 @@ bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, i
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev >= 16) return false;
-    static int ok[16] = {};
-    static int sms[16] = {};
-    if (ok[dev] == 0) {
-        int major = 0, minor = 0;
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev);
-        ok[dev] = major == 7 && minor < 5 &&
-                          cudaFuncSetAttribute(mla_attn_v70_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                               (int) kV7Smem) == cudaSuccess
-                      ? 1
-                      : -1;
-        cudaGetLastError();
-        if (ok[dev] == 1) std::fprintf(stderr, "glm_batch: CUDA%d decode attention: the split one-pass kernel (mma.m8n8k4)\n", dev);
-    }
-    if (ok[dev] != 1) return false;
+    if (mla_v70_ok(dev) != 1) return false;
     // splits of whole 32-cell tiles, about one block a multiprocessor over the head groups (MAYA_GLM_MLA_V70_SPLITS:
     // the splits a head group wants), at most 64 (the combine's weights) and the partial buffer's capacity
     static const int want_splits = [] {
@@ -2489,7 +2500,7 @@ bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, i
         return v ? std::max(1, std::atoi(v)) : 0;
     }();
     const int groups = n_head / T2_H;
-    const int target = std::min(64, std::min(part_cap, want_splits > 0 ? want_splits : std::max(1, sms[dev] / groups)));
+    const int target = std::min(64, std::min(part_cap, want_splits > 0 ? want_splits : std::max(1, g_v70_sms[dev] / groups)));
     const int tiles = (n_sel + T2_C - 1) / T2_C;
     const int cblk = T2_C * ((tiles + target - 1) / target);
     const int n_split = (n_sel + cblk - 1) / cblk;

@@ -3377,18 +3377,28 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     src = RC.slot((size_t) rs);
                 staged.push_back(Staged{e, src, dev});
             }
-            // the prompt's routing feeds the LFU counts the decode's tiers evict by
+            // the prompt's routing feeds the LFU counts the decode's tiers evict by.  STRATA_GLM_PROMPT_CNT=<percent>
+            // (default 100): how much of it - 0 keeps the counts (and their aging) the decode's own, so a prompt read
+            // (an agent's tool output: code) no longer re-ranks the VRAM tier toward what the prompt routed and away
+            // from what the answer routes.  Placement only: every expert computes the same either way.  The long-term
+            // usage (the prestage's prediction) takes the prompt's whole counts as before
+            static const int prompt_cnt_pct = [] {
+                const char* v = getenv("MAYA_GLM_PROMPT_CNT");
+                return v != nullptr ? std::max(0, std::min(100, std::atoi(v))) : 100;
+            }();
             uint64_t ev = 0;
             for (int e = 0; e < NE; ++e) {
-                const int cnt = std::abs(S->h_counts[e]);
+                const int full = std::abs(S->h_counts[e]);
+                if (full == 0) continue;
+                uint32_t& uu = F->usage[(size_t) il * NE + e];
+                uu = (uint32_t) std::min<uint64_t>((uint64_t) uu + (uint64_t) full, 1u << 30);
+                if (uu >= (1u << 30))
+                    for (auto& u : F->usage) u >>= 1;
+                const int cnt = (int) ((int64_t) full * prompt_cnt_pct / 100);
                 if (cnt == 0) continue;
                 uint32_t& cc = F->cnt[(size_t) il * NE + e];
                 cc = (uint32_t) std::min<uint64_t>((uint64_t) cc + (uint64_t) cnt, 1u << 24);
                 ev += (uint64_t) cnt;
-                uint32_t& uu = F->usage[(size_t) il * NE + e];
-                uu = (uint32_t) std::min<uint64_t>((uint64_t) uu + (uint64_t) cnt, 1u << 30);
-                if (uu >= (1u << 30))
-                    for (auto& u : F->usage) u >>= 1;
             }
             F->cnt_events += ev;
             while (F->cnt_events >= 32768) {
@@ -4951,12 +4961,39 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
         Trun = std::max(kMinPrefillChunk, Trun / 2);
         std::fprintf(stderr, "glm prefill: CUDA%d the chunk is %d tokens now (its layout did not fit)\n", dev_, Trun);
     }
-    if (ok) {
+    // STRATA_GLM_READ_TIMING=1 (diagnostic): the lending, the run and the return timed
+    static const bool rd_timing = getenv("MAYA_GLM_READ_TIMING") != nullptr && std::atoi(getenv("MAYA_GLM_READ_TIMING")) != 0;
+    const auto rd_t0 = std::chrono::steady_clock::now();
+    // STRATA_GLM_LEND_PAR=1: the parts lend at once, a thread each - every part's lending touches only its own state
+    // (its pool, tiers, tables and streams; the parts' decode boundaries already run on their own crew threads) and
+    // ends in its own stream syncs, so one after another the 4 parts' relocations and RAM parks added up (~260 ms a
+    // read on 3x V100 + 3060).  The same moves on each part: the same state after.  Off: in order, as before.
+    static const bool lend_par = getenv("MAYA_GLM_LEND_PAR") != nullptr && std::atoi(getenv("MAYA_GLM_LEND_PAR")) != 0;
+    if (ok && lend_par && split_next_ != nullptr) {
+        std::vector<Glm5Model*> ms;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) ms.push_back(m);
+        std::vector<std::string> errs(ms.size());
+        std::vector<char> oks(ms.size(), 1);
+        std::vector<std::thread> th;
+        for (size_t k = 0; k < ms.size(); ++k)
+            th.emplace_back([&, k] {
+                cudaSetDevice(ms[k]->dev_);
+                oks[k] = ms[k]->prefill_lend(errs[k]) ? 1 : 0;
+            });
+        for (auto& t : th) t.join();
+        for (size_t k = 0; k < ms.size(); ++k)
+            if (!oks[k]) {
+                if (ok) err = errs[k];
+                ok = false;
+            }
+        cudaSetDevice(dev_);
+    } else if (ok) {
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
             cudaSetDevice(m->dev_);
             if (!m->prefill_lend(err)) { ok = false; break; }
         }
     }
+    const auto rd_t1 = std::chrono::steady_clock::now();
     // MAYA_GLM_STALL_TEST=<s> (a test of the serve watchdog): every batched prompt stops here for s seconds
     static const int stall_test = [] {
         const char* v = getenv("MAYA_GLM_STALL_TEST");
@@ -4981,6 +5018,7 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
             ok = false;
         }
     }
+    const auto rd_t2 = std::chrono::steady_clock::now();
     progress_at("the prompt: returning the expert pool's tail");
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         m->cap_floor_ = 0;
@@ -4989,6 +5027,13 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
             if (ok) err = return_err;
             ok = false;
         }
+    }
+    if (rd_timing) {
+        const auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        std::fprintf(stderr, "glm read timing: %zu tokens: lend %.1f ms, run %.1f ms, return %.1f ms\n",
+                     tokens.size(), ms(rd_t0, rd_t1), ms(rd_t1, rd_t2), ms(rd_t2, std::chrono::steady_clock::now()));
     }
     cudaSetDevice(dev_);
     return ok;

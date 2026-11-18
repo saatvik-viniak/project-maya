@@ -1145,10 +1145,13 @@ void Glm5Model::pen_free() {   // (on this part's device)
 }
 
 void Glm5Model::pick_tokens(const float* logits, int T, const strata::kernels::SamplerParams& sp, const int32_t* win,
-                            int n0, int* out, cudaStream_t s) {
+                            int n0, int* out, cudaStream_t s, const void* spec_q, const int* spec_d) {
     const int V = (int) g_.n_vocab;
+    using strata::kernels::SpecList;
+    const bool verify = spec_q != nullptr && spec_d != nullptr;
     if (sp.penalty_last_n <= 0) {   // no penalties: the call every site made before, nothing else
-        strata::kernels::sample_tokens(logits, T, V, nullptr, 0, sp, out, s);
+        if (verify) strata::kernels::sample_verify(logits, T, V, sp, (const SpecList*) spec_q, spec_d, out, s);
+        else strata::kernels::sample_tokens(logits, T, V, nullptr, 0, sp, out, s);
         return;
     }
     const std::vector<int32_t>* H = sp.host_history;
@@ -1166,7 +1169,8 @@ void Glm5Model::pick_tokens(const float* logits, int T, const strata::kernels::S
             std::fprintf(stderr, "glm penalties: %s - picks without the penalties (said once)\n", why.c_str());
         strata::kernels::SamplerParams q = sp;
         q.penalty_last_n = 0;
-        strata::kernels::sample_tokens(logits, T, V, nullptr, 0, q, out, s);
+        if (verify) strata::kernels::sample_verify(logits, T, V, q, (const SpecList*) spec_q, spec_d, out, s);
+        else strata::kernels::sample_tokens(logits, T, V, nullptr, 0, q, out, s);
         return;
     }
     // a window's first token is the history's last (what the state was fed last): a caller that lets them part would
@@ -1198,7 +1202,8 @@ void Glm5Model::pick_tokens(const float* logits, int T, const strata::kernels::S
     cudaMemcpyAsync(dev, host, (size_t) T * (size_t) h * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     strata::kernels::SamplerParams q = sp;
     q.penalty_last_n = h;
-    strata::kernels::sample_tokens(logits, T, V, dev, h, q, out, s);
+    if (verify) strata::kernels::sample_verify(logits, T, V, q, (const SpecList*) spec_q, spec_d, out, s, dev, h);
+    else strata::kernels::sample_tokens(logits, T, V, dev, h, q, out, s);
     for (int i = r; i < r + T; ++i) cudaEventRecord(pen_ev_[i], s);
 }
 

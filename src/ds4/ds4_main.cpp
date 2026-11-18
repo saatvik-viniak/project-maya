@@ -3938,6 +3938,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "maya-ds4: sequence %d: %s\n", k, err.empty() ? "no logits" : err.c_str());
                 return 1;
             }
+            if (ppl_step) {   // DS4_PPL_DUMP=file: the decode path's rows, to measure a setting's KL against another run
+                if (const char* pd = std::getenv("DS4_PPL_DUMP")) {
+                    if (std::FILE* pf = std::fopen(pd, "ab")) {
+                        std::fwrite(lg.data(), 4, lg.size(), pf);
+                        std::fclose(pf);
+                    }
+                }
+            }
             double s_nll = 0.0;
             for (size_t i = 0; i + 1 < seq.size(); ++i) {   // row i: the next token's log-probability
                 const float* r = lg.data() + i * (size_t) V;

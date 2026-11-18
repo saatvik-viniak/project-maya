@@ -18,6 +18,8 @@
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
+#include <algorithm>
+#include <random>
 #include <vector>
 
 namespace strata::kernels::cpu {
@@ -259,11 +261,53 @@ bool native_fmt_mixed(int gate_type, int up_type, int d_type, int64_t n_embd, in
     return true;
 }
 
+// Q8_K activations by q8k_quant_avx2 where it is ggml's quantize_row_q8_K bit for bit here (checked once on random
+// rows, ties and a zero block; x86 ggml-cpu runs the scalar reference: E5-2690 v4, a 4096-value row 20.6 -> 4.2 us).
+// STRATA_Q8K_AVX2=0 keeps ggml's.
+namespace {
+bool q8k_fast() {
+    static const bool ok = [] {
+        const char* v = std::getenv("MAYA_Q8K_AVX2");
+        if ((v != nullptr && std::atoi(v) == 0) || !cpu_avx2_ok() || std::getenv("MAYA_NO_IQ256") != nullptr) return false;
+        init_once();
+        const ggml_type_traits_cpu* tq = traits(GGML_TYPE_Q8_K);
+        if (tq == nullptr || tq->from_float == nullptr) return false;
+        std::mt19937 rng(11);
+        std::vector<float> x(4096);
+        std::vector<uint8_t> a(ggml_row_size(GGML_TYPE_Q8_K, 4096)), b(a.size());
+        for (int trial = 0; trial < 64; ++trial) {
+            const float sc = std::exp(std::normal_distribution<float>(0.0f, 3.0f)(rng));
+            for (auto& e : x) e = std::normal_distribution<float>(0.0f, sc)(rng);
+            if (trial % 4 == 1) { const float m = std::fabs(x[17]) * 4.0f; x[300] = -m; x[301] = m; }
+            if (trial % 8 == 3) std::fill(x.begin() + 512, x.begin() + 768, 0.0f);
+            std::fill(a.begin(), a.end(), 0);
+            std::fill(b.begin(), b.end(), 0);
+            tq->from_float(x.data(), a.data(), 4096);
+            q8k_quant_avx2(x.data(), b.data(), 4096);
+            if (a != b) {
+                std::fprintf(stderr, "native experts: the AVX2 Q8_K quantizer differs from ggml-cpu's here - ggml's\n");
+                return false;
+            }
+        }
+        return true;
+    }();
+    return ok;
+}
+}  // namespace
+
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    if (f.gu_act == GGML_TYPE_Q8_K && q8k_fast()) {
+        q8k_quant_avx2(x, dst, f.n_embd);
+        return;
+    }
     traits(f.gu_act)->from_float(x, dst, f.n_embd);
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (f.d_act == GGML_TYPE_Q8_K && q8k_fast()) {
+        q8k_quant_avx2(h, dst, f.n_ff);
+        return;
+    }
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
