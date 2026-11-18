@@ -1854,6 +1854,15 @@ static int glm_pack_generate(const Options& o) {
     // ended (the pool's tail is lent in it); gap_failed: a gap inside a prompt-path call failed (prompt_between_err
     // says why); gaps_over: a gap of this read overran <max gap ms>, so the rest of the read has none
     bool in_read_gap = false, gap_failed = false, read_gap_first = false, gaps_over = false;
+    // decode-through-reads A2: set while a read runs beside the decode - pipe2 hands back as soon as it is (its emit)
+    std::atomic<bool>* read_wake = nullptr;
+    std::function<void()> step_fn;   // multi_step, for gen_admit's A2 loop (it is defined after gen_admit)
+    // MAYA_GLM_PIPE1: one conversation through pipe2 (its jobs take each part's lock, which a read beside it needs) -
+    // 1 always, 2 only while a read runs beside it; the one-conversation decoders are skipped then
+    const auto pipe1_active = [&]() {
+        static const int mode = (int) env_num("MAYA_GLM_PIPE1", 0);
+        return strata::core::Glm5Model::pipe2_on() && (mode == 1 || (mode == 2 && read_wake != nullptr));
+    };
     // a request PAUSEd inside a gap: its context stays busy (nothing else binds or reads into it) until its snapshot is
     // taken as it would have been at once - after the read's call, once its first token is taken (flush_pauses)
     struct DeferredPause {
@@ -3258,10 +3267,101 @@ static int glm_pack_generate(const Options& o) {
             };
             prompt_between = [&, best]() { return interleave_round(best); };
         }
+        // MAYA_GLM_READ_ASYNC_FAKE=1 (decode-through-reads A2, a measurement): with exactly one request decoding through
+        // pipe2 (MAYA_GLM_PIPE1) and a text prompt, a FAKE read first - the pool tails lent for this read's usual time
+        // (0.9 s + 2.9 ms a token to read) on a thread while this one keeps stepping the running request (no tier
+        // boundary meanwhile: in_read_gap) - then the real read as always.  Answers are unchanged; the line says what the
+        // decode kept during the fake read.
+        static const bool fake_async = env_num("MAYA_GLM_READ_ASYNC_FAKE", 0) != 0;
+        if (fake_async && strata::core::Glm5Model::pipe1_on() && strata::core::Glm5Model::pipe2_on() &&
+            cur_img_pos.empty() && model.fast()) {
+            int n_dec = 0;
+            int64_t p0 = 0;
+            for (const auto& gp : gens)
+                if (!gp->done) {
+                    ++n_dec;
+                    p0 += gp->produced;
+                }
+            const bool snap_hit = !snap_tokens.empty() && snap_tokens.size() < g->prompt.size() &&
+                                  std::equal(snap_tokens.begin(), snap_tokens.end(), g->prompt.begin());
+            // (the snapshot misses on agent turns whose history drops the thinking - the read then reuses a slot or the
+            // prompt cache, which this does not see: the fake read is capped at the 3,500 tokens Step A2's gate covers)
+            const size_t T = std::min<size_t>(3500, g->prompt.size() - (snap_hit ? snap_tokens.size() : 0));
+            if (n_dec == 1) {
+                const double want_ms = 900.0 + 2.9 * (double) T;
+                double dec_ms = 0.0;   // the loop's time with a request to decode (the rate's denominator)
+                int64_t dec_tok = 0;
+                // the handshake: decode only while every tail is lent and stays so (lent .. want_back), the reader
+                // returns them once the decode has stopped (stepped_out) - a lend never runs beside a decode step
+                std::atomic<bool> lent{false}, want_back{false}, stepped_out{false}, done{false};
+                bool fr_ok = true;
+                std::string fr_err;
+                const auto t0 = std::chrono::steady_clock::now();
+                std::thread reader([&] {
+                    fr_ok = model.fake_read(want_ms, [&] { lent.store(true); }, [&] {
+                        want_back.store(true);
+                        while (!stepped_out.load()) std::this_thread::sleep_for(std::chrono::microseconds(200));
+                    }, fr_err);
+                    done.store(true);
+                });
+                while (!lent.load() && !done.load()) std::this_thread::sleep_for(std::chrono::microseconds(200));
+                read_wake = &want_back;
+                in_read_gap = true;
+                const uint64_t fails0 = multi_fails;
+                while (!want_back.load() && !done.load()) {
+                    bool live = false;
+                    for (const auto& gp : gens) live = live || !gp->done;
+                    if (!live || multi_fails != fails0) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        continue;
+                    }
+                    int64_t q0 = 0, q1 = 0;
+                    for (const auto& gp : gens) q0 += gp->produced;
+                    const auto s0 = std::chrono::steady_clock::now();
+                    step_fn();
+                    dec_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count();
+                    for (const auto& gp : gens) q1 += gp->produced;
+                    dec_tok += q1 - q0;
+                }
+                if (multi_fails == fails0 && !multi_drain()) multi_fail(err);   // (nothing in flight while it returns)
+                stepped_out.store(true);
+                reader.join();
+                in_read_gap = false;
+                read_wake = nullptr;
+                int64_t p1 = 0;
+                for (const auto& gp : gens) p1 += gp->produced;
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                std::fprintf(stderr, "glm multi: fake read for request %d (%zu tokens, %.0f ms): the other decoded %lld "
+                                     "tokens (%.1f tok/s); while decoding: %lld tokens in %.0f ms (%.1f tok/s)%s%s\n",
+                             rid, T, ms, (long long) (p1 - p0), 1000.0 * (double) (p1 - p0) / std::max(1.0, ms),
+                             (long long) dec_tok, dec_ms, 1000.0 * (double) dec_tok / std::max(1.0, dec_ms),
+                             fr_ok ? "" : " - the lending failed: ", fr_ok ? "" : fr_err.c_str());
+                if (std::any_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->done; }))
+                    gen_sweep();
+                bind_ctx(best);
+            }
+        }
         admit_stop.store(false);
         admitting_rid.store(rid);
+        // decode-through-reads Step A0: a read while another request decodes - its time and what the others got
+        int64_t a0_dec = 0, a0_prod0 = 0;
+        for (const auto& gp : gens)
+            if (!gp->done) {
+                ++a0_dec;
+                a0_prod0 += gp->produced;
+            }
+        const auto a0_t0 = std::chrono::steady_clock::now();
         const int rc = prep_prompt(g->prompt, g->reuse, g->finish, g->t0);
         admitting_rid.store(-1);
+        if (a0_dec > 0) {
+            int64_t a0_prod1 = 0;
+            for (const auto& gp : gens) a0_prod1 += gp->produced;   // (gens only grows during a read)
+            std::fprintf(stderr, "glm multi: request %d's prompt (%zu tokens) read in %.0f ms; the others decoded "
+                                 "%lld tokens meanwhile (%lld decoding)\n",
+                         rid, g->prompt.size() - std::min(g->reuse, g->prompt.size()),
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a0_t0).count(),
+                         (long long) (a0_prod1 - a0_prod0), (long long) a0_dec);
+        }
         prompt_piece = nullptr;
         prompt_between = nullptr;
         model.prefill_gap = nullptr;
@@ -3353,7 +3453,7 @@ static int glm_pack_generate(const Options& o) {
         if (!deferred_pauses.empty() && !in_read_gap && admitting_rid.load() < 0 &&
             std::none_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->ready && !p->done; }))
             flush_pauses();
-        Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
+        Gen* only = gens.size() == 1 && !pipe1_active() ? gens[0].get() : nullptr;
         static const bool spec_win_env = [] {
             const char* e = getenv("MAYA_GLM_SPEC_WIN");
             return e != nullptr && std::atoi(e) != 0;
@@ -3468,7 +3568,8 @@ static int glm_pack_generate(const Options& o) {
                 }
             // the token-at-a-time path's tokens in flight come back first (each then has a token to feed)
             const int pipe_n = strata::core::Glm5Model::pipe_n();
-            if (n_live >= 2 && n_live <= pipe_n && n_pen == 0 && (!flight.empty() || !wflight.empty())) {
+            const int pipe_min = pipe1_active() ? 1 : 2;   // (MAYA_GLM_PIPE1: one conversation too)
+            if (n_live >= pipe_min && n_live <= pipe_n && n_pen == 0 && (!flight.empty() || !wflight.empty())) {
                 if (!multi_drain()) {
                     multi_fail(err);
                     return;
@@ -3480,9 +3581,9 @@ static int glm_pack_generate(const Options& o) {
             for (auto& gp : gens)
                 if (!gp->done && !gp->inflight && gp->pending >= 0 && (pipe2_pen || gp->sp.penalty_last_n <= 0))
                     act.push_back(gp.get());
-            if (n_live >= 2 && n_live <= pipe_n && (int) act.size() == n_live) {
+            if (n_live >= pipe_min && n_live <= pipe_n && (int) act.size() == n_live) {
                 const int nc = n_live;
-                Gen* pg[3] = {act[0], act[1], nc > 2 ? act[2] : nullptr};
+                Gen* pg[3] = {act[0], nc > 1 ? act[1] : nullptr, nc > 2 ? act[2] : nullptr};
                 bind_ctx(pg[0]->ctx);
                 int seqs[3] = {};
                 int32_t pend[3] = {}, fin_force[3] = {};
@@ -3520,7 +3621,7 @@ static int glm_pack_generate(const Options& o) {
                         model.force_next(g.force);
                         g.force = -1;
                     }
-                    return !input_pending();
+                    return !input_pending() && !(read_wake != nullptr && read_wake->load());
                 }, prod, last2, fout, err);
                 if (!ok2) {
                     multi_fail(err);
@@ -3783,6 +3884,8 @@ static int glm_pack_generate(const Options& o) {
         bind_ctx(read_ctx);
         return read_stopped() ? 1 : 0;
     };
+
+    step_fn = [&] { multi_step(); };   // (gen_admit's decode-through-reads A2 loop)
 
     // One decode gap of a prompt's read (MAYA_GLM_PREFILL_GAPS): at a chunk boundary inside a prompt-path call (every
     // part idle, the pool's tail lent; Glm5Model::prefill_gap) or between two of its calls.  The running requests' own

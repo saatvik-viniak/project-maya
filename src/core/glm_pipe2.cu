@@ -47,6 +47,42 @@ bool Glm5Model::pipe2_on() {
     return v;
 }
 
+// MAYA_GLM_READ_ASYNC_FAKE (decode-through-reads A2, a throwaway measurement): a stand-in for a prompt read that runs
+// beside a decode - every part's pool tail lent as a read lends it (each part under its own lock, the one pipe2's jobs
+// take, so a job never sees a part half lent), nothing for the rest of ms (the lending counts in it), the tails back.
+// Nothing of any prompt is computed: it only measures what the lent tails cost the decoder running meanwhile.
+bool Glm5Model::fake_read(double ms, const std::function<void()>& lent, const std::function<void()>& returning,
+                          std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
+    bool ok = true;
+    for (Glm5Model* m = this; m != nullptr && ok; m = m->split_next_.get()) {
+        std::lock_guard<std::mutex> lk(*m->pmu_);
+        cudaSetDevice(m->dev_);
+        ok = m->prefill_lend(err);
+    }
+    // the caller decodes only between lent() and returning()'s return: never while a tail changes hands
+    if (lent) lent();
+    const double lent_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (ok && ms > lent_ms) std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(ms - lent_ms));
+    if (returning) returning();
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        std::lock_guard<std::mutex> lk(*m->pmu_);
+        cudaSetDevice(m->dev_);
+        std::string e;
+        if (!m->prefill_return(e) && ok) {
+            err = e;
+            ok = false;
+        }
+    }
+    cudaSetDevice(dev_);
+    return ok;
+}
+
+bool Glm5Model::pipe1_on() {
+    static const bool on = getenv("MAYA_GLM_PIPE1") != nullptr && std::atoi(getenv("MAYA_GLM_PIPE1")) != 0;
+    return on;
+}
+
 int Glm5Model::pipe_n() {
     static const int v = [] {
         const char* e = getenv("MAYA_GLM_PIPE_N");
@@ -565,7 +601,9 @@ bool Glm5Model::decode_spec_pipe2(int n_conv, const int seqs[], const int32_t pe
                                   strata::kernels::SamplerParams* sp[], const int64_t max_new[], const int32_t force_in[],
                                   const std::function<bool(int, int)>& emit, int64_t produced[], int32_t last[],
                                   int32_t force_out[], std::string& err) {
-    if (n_conv < 2 || n_conv > kPipeN) {
+    // MAYA_GLM_PIPE1=1 (decode-through-reads A2): one conversation through pipe2 too - the decoder that binds its
+    // conversation per job under each part's lock, so it can run beside a prompt read on another context
+    if (n_conv < (pipe1_on() ? 1 : 2) || n_conv > kPipeN) {
         err = "glm pipe2: " + std::to_string(n_conv) + " conversations";
         return false;
     }

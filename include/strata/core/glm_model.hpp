@@ -821,6 +821,10 @@ public:
                            int32_t force_out[], std::string& err);
     static int pipe_n();   // STRATA_GLM_PIPE_N (2; 3: pipe2 takes three conversations too)
     static bool pipe2_on();
+    static bool pipe1_on();   // MAYA_GLM_PIPE1: decode_spec_pipe2 with one conversation (decode-through-reads A2)
+    /// MAYA_GLM_READ_ASYNC_FAKE (A2): every part's tail lent for ms, nothing computed, back (glm_pipe2.cu)
+    bool fake_read(double ms, const std::function<void()>& lent, const std::function<void()>& returning,
+                   std::string& err);
     /// STRATA_GLM_PIPE2_COPY: the key conversation c's history is registered under (glmng::set_history) for
     /// decode_spec_pipe2 on this model (the head part)
     static const void* pipe2_copy_key(const Glm5Model* m, int c) { return reinterpret_cast<const char*>(m) + 1 + c; }
