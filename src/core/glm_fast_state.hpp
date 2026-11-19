@@ -923,8 +923,6 @@ struct Glm5Model::FastState {
         unsigned int* scr = nullptr;        // [0] the layer's scratch claims, [1] sticky: a slot taken twice
         unsigned int* scr_h = nullptr;      // pinned: [1] read after the window
         unsigned int* cpu_seq_w = nullptr;  // [tmax] seq words 64 bytes apart
-        gf::CpuAnswer* ans_h[16] = {};      // host-mapped answer slots for tokens 1.. (token 0: cpu_ans_h)
-        void* ans_d[16] = {};
         bool per_token = false;             // the batched MoE off for this pass (the redo after a scratch clash)
         bool piped = false;                 // this window is a pipelined one (win_pipe_begin), not window()'s
         int pipe_t = -1;                    // window_pipe: the token whose layers are being enqueued (its KDA inputs
@@ -980,6 +978,8 @@ struct Glm5Model::FastState {
     unsigned long long cpu_plan = 0;
     unsigned long long cpu_plan_start = 0;   // ... the plan the engine started with (set_pcie_share(-1) restores it)
     gf::CpuAnswer* cpu_ans_h = nullptr;                      // host-mapped
+    gf::CpuAnswer* win_ans_h[16] = {};                       // host-mapped verify-window slots 1.. (shared across pctx_bind)
+    void* win_ans_d[16] = {};
     unsigned int* cpu_seq_d = nullptr;
     unsigned int* dcnt_d = nullptr;                          // the device's route counts (the coldest go to the host)
     std::vector<strata::kernels::cpu::NativeFmt> cpu_fmt;   // per layer; n_ff == 0: the lane skips that layer

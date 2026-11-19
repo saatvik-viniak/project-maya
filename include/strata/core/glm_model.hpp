@@ -1093,6 +1093,7 @@ public:
     void win2_commit_wait(int c);
     void crew2_stop();
     bool win_pipe_part(int k, int t, std::string& err);   // part k's share of window token t (a crew thread's job)
+    bool win_pipe_window_part(int k, int T, std::string& err);   // part k's share of all T window tokens (pipe2 winmajor)
     void win_crew_stop();
     /// window_pipe's token t: KDA layer il's projections go to its window input rows (window_commit replays from them)
     void win_kda_rows(int il, int t, float** proj, float** fa, float** ga, float** beta);

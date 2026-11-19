@@ -232,8 +232,6 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
     if (W.emb_h) cudaFreeHost(W.emb_h);
     if (W.hop_h) cudaFreeHost(W.hop_h);
     if (W.scr_h) cudaFreeHost(W.scr_h);
-    for (auto* a : W.ans_h)
-        if (a) cudaFreeHost(a);
     cudaEvent_t ev = W.ev_hop;
     cudaEvent_t evt[kPipeSlots], evp[kPipeSlots];
     std::copy(std::begin(W.ev_tok), std::end(W.ev_tok), evt);
@@ -357,6 +355,7 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
         return false;
     }
     for (int t = 1; t < tmax && t < 16; ++t) {
+        if (F->win_ans_h[t] != nullptr) continue;
         void* h = nullptr;
         if (cudaHostAlloc(&h, sizeof(gf::CpuAnswer), cudaHostAllocMapped) != cudaSuccess) {
             cudaGetLastError();
@@ -364,8 +363,8 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
             return false;
         }
         std::memset(h, 0, sizeof(gf::CpuAnswer));
-        W.ans_h[t] = (gf::CpuAnswer*) h;
-        cudaHostGetDevicePointer(&W.ans_d[t], h, 0);
+        F->win_ans_h[t] = (gf::CpuAnswer*) h;
+        cudaHostGetDevicePointer(&F->win_ans_d[t], h, 0);
     }
     if (cudaHostAlloc((void**) &W.scr_h, 64, cudaHostAllocPortable) != cudaSuccess ||
         cudaHostAlloc((void**) &W.tok_h, TS * sizeof(int), cudaHostAllocPortable) != cudaSuccess ||
@@ -467,8 +466,6 @@ void Glm5Model::win_free() {
         if (e) cudaEventDestroy(e);
     if (W.uid) cudaFree(W.uid);
     if (W.scr_h) cudaFreeHost(W.scr_h);
-    for (auto* a : W.ans_h)
-        if (a) cudaFreeHost(a);
     W = FastState::Win{};
     if (fast_->cap) cudaFree(fast_->cap);
     fast_->cap = nullptr;
@@ -742,7 +739,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             mt.cpu_flag = W.mcpu_flag + t;
             if (t > 0 && md.cpu_seq != nullptr) {
                 mt.cpu_seq = W.cpu_seq_w + 16 * t;
-                mt.cpu_ans = W.ans_d[t];
+                mt.cpu_ans = F->win_ans_d[t];
             }
             return mt;
         };
@@ -1590,6 +1587,122 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     cudaEventRecord(W.ev_pick[sl], F->cs);
     spec_tl::at_stream(F->cs, 'g', k, (int) p, (int) W.p0);
     spec_tl::host('e', k, (int) p, (int) W.p0);
+    return true;
+}
+
+// MAYA_GLM_PIPE2_WINMAJOR=1 (W2): part k's share of ALL T rows of the bound conversation's verify window in one
+// window-major pass via fast_window_layers (dense/hc/MoE pairing + merged CPU lane), keeping cross-part pipelining
+// at window granularity and per-row ev_pick / head_x slots on the last part so win2_pick / win2_commit stay unchanged.
+bool Glm5Model::win_pipe_window_part(int k, int T, std::string& err) {
+    Glm5Model* m = this;
+    Glm5Model* prev = nullptr;
+    for (int i = 0; i < k; ++i) {
+        prev = m;
+        m = m->split_next_.get();
+    }
+    const Glm5Geometry& g = g_;
+    const int E = g.n_embd;
+    const size_t hcE = (size_t) g.hc * E;
+    FastState* F = m->fast_;
+    auto& W = F->win;
+    const int sl0 = W.bank * kPipeMax;
+    cudaSetDevice(m->dev_);
+    spec_tl::host('E', k, (int) W.p0, T);
+    W.per_token = false;
+    W.stagger_now = win_stagger_mode() != kStagOff;
+    if (W.scr != nullptr) {
+        cudaMemsetAsync(W.scr, 0, 4 * sizeof(unsigned int), F->cs);
+        if (W.scr_h != nullptr) {
+            W.scr_h[8] = 0xF0u | (0x0Fu << 8);
+            W.scr_h[9] = 0x0Fu | (0xF0u << 8);
+            cudaMemcpyAsync(W.scr + 8, W.scr_h + 8, 2 * sizeof(unsigned int), cudaMemcpyHostToDevice, F->cs);
+        }
+    }
+    if (prev == nullptr) {
+        spec_tl::at_stream(F->cs, 'G', k, (int) W.p0, T);
+        cudaMemcpyAsync(W.emb + (size_t) sl0 * E, W.emb_h + (size_t) sl0 * E, (size_t) T * E * sizeof(float),
+                        cudaMemcpyHostToDevice, F->cs);
+        for (int t = 0; t < T; ++t) {
+            if (g.mhc())
+                gf::embed_streams(W.emb + (size_t) (sl0 + t) * E, W.R[0] + (size_t) t * hcE, E, F->cs);
+            else
+                glmres::res_embed(g, W.emb + (size_t) (sl0 + t) * E, W.R[0] + (size_t) t * hcE, F->cs);
+        }
+    } else {
+        const int psl0 = prev->fast_->win.bank * kPipeMax;
+        const size_t bytes = (size_t) T * hcE * sizeof(float);
+        cudaStreamWaitEvent(F->cs, prev->fast_->win.ev_tok[psl0 + T - 1], 0);
+        spec_tl::at_stream(F->cs, 'G', k, (int) W.p0, T);
+        cudaMemcpyAsync(W.R[0], prev->fast_->win.hop_h + (size_t) psl0 * hcE, bytes, cudaMemcpyHostToDevice, F->cs);
+    }
+    F->bnd_tokens.fetch_add(T, std::memory_order_relaxed);
+    gf::set_skip(nullptr);
+    if (!m->fast_window_layers(W.p0, T, err)) return false;
+    if (m->split_next_) {
+        const size_t bytes = (size_t) T * hcE * sizeof(float);
+        cudaMemcpyAsync(W.hop_h + (size_t) sl0 * hcE, W.R[W.out], bytes, cudaMemcpyDeviceToHost, F->cs);
+        cudaEventRecord(W.ev_tok[sl0 + T - 1], F->cs);
+        spec_tl::at_stream(F->cs, 'g', k, (int) W.p0, T);
+        spec_tl::host('e', k, (int) W.p0, T);
+        return true;
+    }
+    // last part: head_prep into bank slots sl0..sl0+T-1, batched LM head (ncol=T), per-row picks + ev_pick[sl]
+    if (m->head_split_ready()) {
+        for (int t = 0; t < T; ++t) {
+            const int sl = sl0 + t;
+            float* hx = W.head_x + (size_t) sl * E;
+            void* hq = (uint8_t*) W.head_xq + (size_t) sl * W.xq_s;
+            float* lg = W.logits + (size_t) sl * g.n_vocab;
+            if (g.mhc())
+                gf::head_prep(W.R[W.out] + (size_t) t * hcE, m->w_.at("output_norm.weight"), g.norm_eps, E, hx, hq, F->cs);
+            else
+                glmres::res_head(g, W.R[W.out] + (size_t) t * hcE, m->w_.at("output_norm.weight"), hx, hq, F->cs);
+            if (!m->win_head_split(t, sl, hx, lg, err)) return false;
+            cudaMemcpyAsync(W.tok_h + sl, W.tok + sl, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
+            cudaEventRecord(W.ev_pick[sl], F->cs);
+        }
+    } else {
+        for (int t = 0; t < T; ++t) {
+            const int sl = sl0 + t;
+            float* hx = W.head_x + (size_t) sl * E;
+            void* hq = (uint8_t*) W.head_xq + (size_t) sl * W.xq_s;
+            if (g.mhc())
+                gf::head_prep(W.R[W.out] + (size_t) t * hcE, m->w_.at("output_norm.weight"), g.norm_eps, E, hx, hq, F->cs);
+            else
+                glmres::res_head(g, W.R[W.out] + (size_t) t * hcE, m->w_.at("output_norm.weight"), hx, hq, F->cs);
+        }
+        const WSlot& ow = m->ws_map_.at("output.weight");
+        gf::MvJob o = {ow.q, (uint8_t*) W.head_xq + (size_t) sl0 * W.xq_s, W.head_x + (size_t) sl0 * E,
+                       W.logits + (size_t) sl0 * g.n_vocab, nullptr, 1.0f, ow.type, E, g.n_vocab};
+        if (ow.type == 0) o.w = ow.f32;
+        o.ncol = T;
+        o.xq_cstride = (int64_t) W.xq_s;
+        o.xf_cstride = E;
+        o.y_cstride = g.n_vocab;
+        if (!gf::mv(&o, 1, F->cs)) {
+            err = "glm window: output head (type " + std::to_string(ow.type) + ")";
+            return false;
+        }
+        for (int t = 0; t < T; ++t) {
+            const int sl = sl0 + t;
+            float* lg = W.logits + (size_t) sl * g.n_vocab;
+            if (W.pick_sampled) {
+                strata::kernels::SamplerParams sp = W.pick_sp;
+                sp.counter += (uint64_t) t;
+                if (t < W.spec_n && W.spec_q != nullptr && W.spec_d != nullptr)
+                    m->pick_tokens(lg, 1, sp, W.pick_tok + sl0, t, W.tok + sl, F->cs,
+                                   (const strata::kernels::SpecList*) W.spec_q + t, W.spec_d + t);
+                else
+                    m->pick_tokens(lg, 1, sp, W.pick_tok + sl0, t, W.tok + sl, F->cs);
+            } else {
+                gf::argmax(lg, g.n_vocab, W.tok + sl, F->cs);
+            }
+            cudaMemcpyAsync(W.tok_h + sl, W.tok + sl, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
+            cudaEventRecord(W.ev_pick[sl], F->cs);
+        }
+    }
+    spec_tl::at_stream(F->cs, 'g', k, (int) W.p0, T);
+    spec_tl::host('e', k, (int) W.p0, T);
     return true;
 }
 

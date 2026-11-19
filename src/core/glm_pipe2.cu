@@ -100,6 +100,14 @@ namespace {
 // draft to keep it), so the output is the same as without; the NextN cache entry the skipped first draft step would
 // have written (position N-1) is written at the commit with the kept rows'.
 // STRATA_GLM_PIPE2_PEN_SPEC (on): a request with penalties keeps speculative sampling (0: its drafts greedy, A/B)
+static bool pipe2_winmajor_on() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_PIPE2_WINMAJOR");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 static bool pipe2_pen_spec() {
     static const bool on = [] {
         const char* v = getenv("MAYA_GLM_PIPE2_PEN_SPEC");
@@ -210,6 +218,7 @@ struct Glm5Model::Crew2 {
     struct Job {
         int c, t;        // t >= 0: row t of conversation c's window; t < 0: its commit of -1 - t rows
         bool fresh;      // (row 0) the window's begin waits for the device
+        int win_T = 0;   // > 0: window-major job for conversation c's win_T rows (MAYA_GLM_PIPE2_WINMAJOR=1)
     };
     struct Worker {
         std::thread th;
@@ -260,7 +269,7 @@ void Glm5Model::crew2_stop() {
 
 static void crew2_start(Glm5Model* head, Glm5Model::Crew2*& crew, int n_parts,
                         const std::function<Glm5Model*(int)>& part_of,
-                        const std::function<int(Glm5Model*, int, int, int, bool, std::string&)>& run) {
+                        const std::function<int(Glm5Model*, int, int, int, bool, int, std::string&)>& run) {
     if (crew != nullptr) return;
     (void) head;
     crew = new Glm5Model::Crew2();
@@ -297,8 +306,9 @@ static void crew2_start(Glm5Model* head, Glm5Model::Crew2*& crew, int n_parts,
                             if (seen[it->c]) continue;
                             seen[it->c] = true;
                             if (pass == 0 && it->c == defer) continue;
+                            const int need_done = it->win_T > 0 ? it->win_T : (it->t + 1);
                             const bool ready = it->t < 0 || before == nullptr ||
-                                               before->done[it->c].load(std::memory_order_acquire) > it->t ||
+                                               before->done[it->c].load(std::memory_order_acquire) >= need_done ||
                                                C->failed.load(std::memory_order_relaxed);
                             if (!ready) continue;
                             if (best == wk->jobs.end() || (prio && it->t < best->t)) best = it;
@@ -318,12 +328,12 @@ static void crew2_start(Glm5Model* head, Glm5Model::Crew2*& crew, int n_parts,
                 }
                 std::string e;
                 if (j.t < 0) {
-                    if (!C->failed.load(std::memory_order_relaxed) && run(m, k, j.c, j.t, false, e) == 0) C->fail(e);
+                    if (!C->failed.load(std::memory_order_relaxed) && run(m, k, j.c, j.t, false, 0, e) == 0) C->fail(e);
                     wk->commits[j.c].fetch_add(1, std::memory_order_release);
                     continue;
                 }
                 if (!C->failed.load(std::memory_order_relaxed)) {
-                    const int r = run(m, k, j.c, j.t, j.fresh, e);
+                    const int r = run(m, k, j.c, j.t, j.fresh, j.win_T, e);
                     if (r == 2) {   // (not ready yet: back in front of its conversation's jobs)
                         {
                             std::lock_guard<std::mutex> lk(wk->mu);
@@ -336,7 +346,7 @@ static void crew2_start(Glm5Model* head, Glm5Model::Crew2*& crew, int n_parts,
                     if (r == 0) C->fail(e);
                 }
                 if (j.c == defer) defer = -1;
-                wk->done[j.c].store(j.t + 1, std::memory_order_release);
+                wk->done[j.c].store(j.win_T > 0 ? j.win_T : j.t + 1, std::memory_order_release);
             }
         });
     }
@@ -398,7 +408,7 @@ bool Glm5Model::win2_begin(int c, int32_t first, const strata::kernels::SamplerP
                         for (int i = 0; i < k; ++i) m = m->split_next_.get();
                         return m;
                     },
-                    [this](Glm5Model* m, int k, int cc, int t, bool fr, std::string& e) -> int {
+                    [this](Glm5Model* m, int k, int cc, int t, bool fr, int win_T, std::string& e) -> int {
                         // a row reads the previous part's window too (its hop slot and event): both bound to the
                         // row's conversation, their locks in part order
                         Glm5Model* prev = nullptr;
@@ -426,12 +436,14 @@ bool Glm5Model::win2_begin(int c, int32_t first, const strata::kernels::SamplerP
                                 std::lock_guard<std::mutex> l0(*prev->pmu_);
                                 prev->pctx_bind(cc);
                                 auto& PW = prev->fast_->win;
-                                pe = PW.ev_tok[PW.bank * kPipeMax + t];
+                                const int et = win_T > 0 ? (win_T - 1) : t;
+                                pe = PW.ev_tok[PW.bank * kPipeMax + et];
                                 from = PW.from;
                             }
                             cudaSetDevice(prev->dev_);
                             // (a row past a wrong draft skips its work: no reason to hold it back)
-                            if (cudaEventQuery(pe) == cudaErrorNotReady && (from == nullptr || *from > t)) return 2;
+                            if (cudaEventQuery(pe) == cudaErrorNotReady && (win_T > 0 || from == nullptr || *from > t))
+                                return 2;
                         }
                         std::unique_lock<std::mutex> lp;
                         if (prev != nullptr) {
@@ -446,6 +458,7 @@ bool Glm5Model::win2_begin(int c, int32_t first, const strata::kernels::SamplerP
                             return 1;
                         }
                         if (t == 0 && !m->win_pipe_begin_part(fr, e)) return 0;
+                        if (win_T > 0) return win_pipe_window_part(k, win_T, e) ? 1 : 0;
                         return win_pipe_part(k, t, e) ? 1 : 0;
                     });
     }
@@ -460,6 +473,21 @@ bool Glm5Model::win2_begin(int c, int32_t first, const strata::kernels::SamplerP
 bool Glm5Model::win2_push(int c, int32_t token, std::string& err) {
     Crew2* C = crew2_;
     if (token < 0) {
+        if (pipe2_winmajor_on()) {
+            int T = 0;
+            {
+                std::lock_guard<std::mutex> lk(*pmu_);
+                pctx_bind(c);
+                T = fast_->win.T;
+            }
+            C->hold[c] = false;
+            C->held[c].clear();
+            if (T > 0) {
+                const Crew2::Job j{c, 0, C->fresh[c], T};
+                for (int k = 0; k < (int) C->w.size(); ++k) C->push(k, j);
+            }
+            return true;
+        }
         if (C->hold[c]) {
             C->hold[c] = false;
             for (const auto& j : C->held[c]) C->push((int) C->w.size() - 1, j);
@@ -496,7 +524,8 @@ bool Glm5Model::win2_push(int c, int32_t token, std::string& err) {
         W.pick_tok[W.bank * kPipeMax + t] = token;
         W.T = t + 1;
     }
-    const Crew2::Job j{c, t, C->fresh[c]};
+    if (pipe2_winmajor_on()) return true;
+    const Crew2::Job j{c, t, C->fresh[c], 0};
     for (int k = 0; k < (int) C->w.size(); ++k) {
         if (C->hold[c] && k + 1 == (int) C->w.size()) {
             C->held[c].push_back(j);
@@ -614,6 +643,12 @@ bool Glm5Model::decode_spec_pipe2(int n_conv, const int seqs[], const int32_t pe
         return false;
     }
     if (crew_ != nullptr) win_crew_stop();   // (the one-conversation crew: its threads would race ours on the streams)
+    if (pipe2_winmajor_on()) {
+        static std::atomic<bool> said_wm{false};
+        if (!said_wm.exchange(true))
+            std::fprintf(stderr, "glm pipe2: window-major verify dispatch on (W2, win_lanes=%d)\n",
+                         fast_ != nullptr && fast_->win_lane[0] != nullptr && fast_->win_lane[1] != nullptr ? 1 : 0);
+    }
     const Glm5Geometry& g = g_;
     int n_cap = std::min(p2_draft_cap(), std::min(kPipeMax - 1, 8));
     // STRATA_GLM_PIPE_N_DRAFT=<n>: at most n drafts a round while three conversations run (each row is a third of the

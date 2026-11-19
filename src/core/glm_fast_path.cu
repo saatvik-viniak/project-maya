@@ -3456,6 +3456,7 @@ void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, 
     auto& C = F->cpu_win;
     constexpr int kMaxE = kWinMax * 8;
     const auto t0 = std::chrono::steady_clock::now();
+    const double tl0 = spec_tl::on() ? spec_tl::now_ms() : 0.0;
     // the tokens' CPU experts in plan order (their sums' order), each entry mapped to its distinct expert
     int ne[kWinMax] = {};
     float w[kWinMax][8];
@@ -3490,8 +3491,9 @@ void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, 
         const char* v = getenv("MAYA_GLM_WIN_X3_POOLS");
         return v != nullptr && std::atoi(v) == 1 ? 1 : 2;
     }();
-    // a batched rows group (win_rows): every expert on this part's own pool - the other part's pool computes its group
-    const bool own = rq[0]->win_rows != 0;
+    // a batched rows group (win_rows) or two lanes sharing one pool (W1a): every expert on this part's pool in one run
+    const bool own = rq[0]->win_rows != 0 ||
+                     (F->win_lane[0] != nullptr && F->win_lane[1] != nullptr && F->win_lane[0]->pool == F->win_lane[1]->pool);
     for (int k = 0; k < nu; ++k) {
         const int h = own || (Ly.exl3 && x3_pools == 1) || load[0] <= load[1] ? 0 : 1;
         half[h][nh[h]++] = order[k];
@@ -3617,6 +3619,7 @@ void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, 
     }
     std::atomic_thread_fence(std::memory_order_release);
     for (int j = 0; j < nb; ++j) ans[j]->seq = seq[j];
+    if (spec_tl::on()) spec_tl::lane(dev_, il, nu, tl0, spec_tl::now_ms());
     F->cpu_experts.fetch_add((uint64_t) nu, std::memory_order_relaxed);
     F->cpu_routes.fetch_add((uint64_t) nb, std::memory_order_relaxed);
     F->cpu_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
@@ -4861,6 +4864,10 @@ void Glm5Model::fast_destroy() {
     }
     if (F->helper_owned_d) cudaFree(F->helper_owned_d);
     if (F->cpu_ans_h) cudaFreeHost(F->cpu_ans_h);
+    for (auto*& a : F->win_ans_h) {
+        if (a) cudaFreeHost(a);
+        a = nullptr;
+    }
     if (F->cpu_seq_d) cudaFree(F->cpu_seq_d);
     if (F->dcnt_d) cudaFree(F->dcnt_d);
     if (F->spec_live_h) cudaFreeHost(F->spec_live_h);   // (MAYA_GLM_SPEC_CANCEL)
@@ -5516,7 +5523,7 @@ void Glm5Model::fast_service() {
                     w[ne++] = rq->w[i];
                 }
             gf::CpuAnswer* ans = F->cpu_ans_h;
-            if (rq->win > 0 && rq->win < 16 && F->win.ans_h[rq->win] != nullptr) ans = F->win.ans_h[rq->win];
+            if (rq->win > 0 && rq->win < 16 && F->win_ans_h[rq->win] != nullptr) ans = F->win_ans_h[rq->win];
             fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part);
             std::atomic_thread_fence(std::memory_order_release);
             ans->seq = next;
@@ -5856,7 +5863,7 @@ void Glm5Model::fast_service() {
         if (held) {
             if (rq->cpu_mask != 0u) {
                 w_rq[w_n] = rq;
-                w_ans[w_n] = rq->win > 0 && rq->win < 16 && F->win.ans_h[rq->win] != nullptr ? F->win.ans_h[rq->win]
+                w_ans[w_n] = rq->win > 0 && rq->win < 16 && F->win_ans_h[rq->win] != nullptr ? F->win_ans_h[rq->win]
                                                                                             : F->cpu_ans_h;
                 w_seq[w_n++] = next;
             }
@@ -5887,7 +5894,7 @@ void Glm5Model::fast_service() {
                 }
             // a verify window's token answers into its own slot (the device waits for them at the layer's end)
             gf::CpuAnswer* ans = F->cpu_ans_h;
-            if (rq->win > 0 && rq->win < 16 && F->win.ans_h[rq->win] != nullptr) ans = F->win.ans_h[rq->win];
+            if (rq->win > 0 && rq->win < 16 && F->win_ans_h[rq->win] != nullptr) ans = F->win_ans_h[rq->win];
             if (F->helper.device() >= 0) {
                 const auto& ly = F->L[(size_t) rq->layer];
                 std::fill_n(ans->part, g.n_embd, 0.0f);

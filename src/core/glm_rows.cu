@@ -731,7 +731,7 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         m.scratch = F->rows_scr + 8 * i;
         if (i > 0 && md.cpu_seq != nullptr) {
             m.cpu_seq = W.cpu_seq_w + 16 * i;
-            m.cpu_ans = W.ans_d[i];
+            m.cpu_ans = F->win_ans_d[i];
         }
         return m;
     };
