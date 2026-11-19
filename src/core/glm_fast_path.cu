@@ -4110,6 +4110,21 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                                      "unpinned\n", dev_, F->cpu_pool->active(), tb);
         }
     }
+    // glm-dsa campaign 2026-11-18 (W1a): arm the verify window's merged CPU lane for the split GLM
+    // config too - both lanes on this part's pool (the win is the call-merge + expert dedup, not
+    // extra threads; a two-GPU DFlash split already arms them this way with the parts' pools).
+    // Off unless MAYA_GLM_WIN_LANES_GLMSPLIT=1.
+    if (F->win_lane[0] == nullptr && F->cpu_pool != nullptr) {
+        static const bool glm_split_lanes = [] {
+            const char* v = getenv("MAYA_GLM_WIN_LANES_GLMSPLIT");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (glm_split_lanes) {
+            win_lanes_make(F->cpu_pool, F->cpu_pool, F->cpu_pin, F->cpu_pin);
+            std::fprintf(stderr, "glm fast: CUDA%d verify-window merged CPU lane on (GLM split, W1a, pool %d threads)\n",
+                         dev_, F->cpu_pool->active());
+        }
+    }
     // MAYA_GLM_CPU_CAL=<file>: reuse the timed values across starts, keyed by build, model, layer, card and pool
     const char* calf = getenv("MAYA_GLM_CPU_CAL");
     std::string cal_key;
