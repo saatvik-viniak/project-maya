@@ -513,7 +513,7 @@ private:
             cv_.notify_all();
         }
         const int my_nd = current_node();
-        drain_fast(s, S, g, my_nd, /*caller=*/true);
+        drain_fast(s, S, g, my_nd, S.prio.load(std::memory_order_relaxed), /*caller=*/true);
         const int tot = J0 + J1;
         while (S.done[0].v.load(std::memory_order_acquire) + S.done[1].v.load(std::memory_order_acquire) < tot)
             cpu_relax();
@@ -522,7 +522,15 @@ private:
         open_mask_.fetch_and(~(1u << s), std::memory_order_release);
         S.busy.store(false, std::memory_order_release);
     }
-    void drain_fast(int s, FastSlot& S, uint64_t g, int my_nd, bool caller) {
+    bool has_higher_open(uint32_t m, int my_prio) const {
+        while (m) {
+            const int o = __builtin_ctz(m);
+            m &= m - 1;
+            if (fslots_[o].prio.load(std::memory_order_relaxed) > my_prio) return true;
+        }
+        return false;
+    }
+    void drain_fast(int s, FastSlot& S, uint64_t g, int my_nd, int my_prio, bool caller) {
         const bool is_numa = S.numa.load(std::memory_order_relaxed);
         const int pref = is_numa ? (my_nd == S.n0.load(std::memory_order_relaxed) ? 0 : 1) : 0;
         const int n_pass = is_numa ? 2 : 1;
@@ -541,31 +549,41 @@ private:
                 if (is_numa) (*f2)(h, idx);
                 else (*f1)(idx);
                 ++did;
-                // When another slot is also open, yield back to pick_fast so higher-prio GPU parts preempt promptly
-                if (!caller && (open_mask_.load(std::memory_order_relaxed) & ~(1u << s)) != 0) goto done_out;
+                // Only yield back to pick_fast when another open slot has STRICTLY HIGHER priority
+                if (!caller) {
+                    const uint32_t om = open_mask_.load(std::memory_order_relaxed) & ~(1u << s);
+                    if (om != 0 && has_higher_open(om, my_prio)) goto done_out;
+                }
             }
         }
     done_out:
         if (did) S.done[pref].v.fetch_add(did, std::memory_order_release);
     }
-    int pick_fast(uint32_t m, int my_nd, uint64_t& bg) {
-        int best = -1, bp = 0;
+    int pick_fast(uint32_t m, int my_nd, uint64_t& bg, int& bp_out) {
+        int best = -1, bp = -1000000;
         while (m) {
             const int s = __builtin_ctz(m);
             m &= m - 1;
             FastSlot& S = fslots_[s];
-            const uint64_t t0 = S.ticket[0].v.load(std::memory_order_acquire);
-            const uint64_t t1 = S.ticket[1].v.load(std::memory_order_acquire);
-            const int n0_lim = S.total[0].load(std::memory_order_relaxed);
-            const int n1_lim = S.total[1].load(std::memory_order_relaxed);
-            const bool ok0 = (t0 & 0xffffffffu) != kClosed && (int) (t0 & 0xffffffffu) < n0_lim;
-            const bool ok1 = (t1 & 0xffffffffu) != kClosed && (int) (t1 & 0xffffffffu) < n1_lim;
-            if (!ok0 && !ok1) continue;
-            const uint64_t g = ok0 ? (t0 >> 32) : (t1 >> 32);
             const int p = S.prio.load(std::memory_order_relaxed);
-            if (best < 0 || p > bp) best = s, bp = p, bg = g;
+            if (best >= 0 && p <= bp) continue;
+            const bool is_numa = S.numa.load(std::memory_order_relaxed);
+            const int pref = is_numa ? (my_nd == S.n0.load(std::memory_order_relaxed) ? 0 : 1) : 0;
+            // Check LOCAL socket ticket FIRST so workers avoid cross-socket QPI loads while local jobs remain
+            const uint64_t tl = S.ticket[pref].v.load(std::memory_order_acquire);
+            const uint32_t il = (uint32_t) tl;
+            if (il != kClosed && (int) il < S.total[pref].load(std::memory_order_relaxed)) {
+                best = s, bp = p, bg = tl >> 32;
+                continue;
+            }
+            if (!is_numa) continue;
+            const int rem = 1 - pref;
+            const uint64_t tr = S.ticket[rem].v.load(std::memory_order_acquire);
+            const uint32_t ir = (uint32_t) tr;
+            if (ir != kClosed && (int) ir < S.total[rem].load(std::memory_order_relaxed))
+                best = s, bp = p, bg = tr >> 32;
         }
-        (void) my_nd;
+        bp_out = bp;
         return best;
     }
     void loop_fast(int id, int pinned_nd) {
@@ -585,9 +603,10 @@ private:
             if (m != 0) {
                 const int nd = pinned_nd >= 0 ? pinned_nd : current_node();
                 uint64_t g = 0;
-                const int s = pick_fast(m, nd, g);
+                int bp = 0;
+                const int s = pick_fast(m, nd, g, bp);
                 if (s >= 0) {
-                    drain_fast(s, fslots_[s], g, nd, /*caller=*/false);
+                    drain_fast(s, fslots_[s], g, nd, bp, /*caller=*/false);
                     have_t0 = false;
                     spins = 0;
                     continue;
